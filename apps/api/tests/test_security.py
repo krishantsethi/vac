@@ -757,3 +757,59 @@ def test_api_responses_are_not_cacheable(client):
     for path in ("/api/v1/health", "/api/v1/auth/me"):
         cc = client.get(path).headers.get("cache-control", "")
         assert "no-store" in cc, f"{path} missing no-store: {cc!r}"
+
+
+def test_production_cookie_is_partitioned(client, monkeypatch):
+    """CHIPS: required for the cookie to exist at all inside a cross-site frame.
+
+    The app is opened in an iframe on another registrable domain, which makes its
+    own session cookie third-party. Where the browser blocks those, an ordinary
+    SameSite=None cookie is never stored and never replayed — the request arrives
+    with no credential even though login returned 200. `Partitioned` gives it a
+    jar keyed to the top-level site, which is the supported way to keep state in
+    an embedded context.
+    """
+    from app import auth
+    monkeypatch.setattr(auth, "SESSION_COOKIE_SECURE", "true")
+    monkeypatch.setattr(auth, "SESSION_COOKIE_SAMESITE", "none")
+    monkeypatch.setattr(auth, "SESSION_COOKIE_PARTITIONED", True)
+    raw = _login(client).headers.get("set-cookie", "")
+    assert "partitioned" in raw.lower(), raw
+    assert "secure" in raw.lower(), "Partitioned is only honoured together with Secure"
+    assert "httponly" in raw.lower()
+
+
+def test_clearing_the_cookie_matches_the_attributes_it_was_set_with(client, monkeypatch):
+    """A browser only deletes a cookie whose attributes match the stored one."""
+    from app import auth
+    monkeypatch.setattr(auth, "SESSION_COOKIE_SECURE", "true")
+    monkeypatch.setattr(auth, "SESSION_COOKIE_SAMESITE", "none")
+    monkeypatch.setattr(auth, "SESSION_COOKIE_PARTITIONED", True)
+    _login(client)
+    cleared = client.post("/api/v1/auth/logout").headers.get("set-cookie", "").lower()
+    assert "partitioned" in cleared
+    assert "samesite=none" in cleared
+    assert "secure" in cleared
+    assert "max-age=0" in cleared or "expires=" in cleared
+
+
+def test_partitioned_attribute_is_not_duplicated():
+    """The header is rewritten in place, so appending must be idempotent."""
+    from fastapi.responses import JSONResponse
+    from app import auth
+    r = JSONResponse({"ok": True})
+    auth.set_session_cookie(r, "TOKEN", None)
+    auth._append_partitioned(r, auth.SESSION_COOKIE_NAME)
+    auth._append_partitioned(r, auth.SESSION_COOKIE_NAME)
+    cookies = [v.decode() for k, v in r.raw_headers if k.lower() == b"set-cookie"]
+    assert len(cookies) == 1, cookies
+    assert cookies[0].lower().count("partitioned") == 1, cookies[0]
+
+
+def test_cookie_helpers_survive_a_missing_response_header():
+    """Appending to a response with no matching cookie must not raise."""
+    from fastapi.responses import JSONResponse
+    from app import auth
+    r = JSONResponse({"ok": True})
+    auth._append_partitioned(r, "some_other_cookie")   # no-op, must not throw
+    assert not [v for k, v in r.raw_headers if k.lower() == b"set-cookie"]

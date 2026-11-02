@@ -8,8 +8,10 @@ import { AlertTriangle, ArrowRight, CheckCircle2, Loader2, Lock, ShieldCheck, XC
 import { toast } from "@/components/ui/toast";
 
 import { API } from "@/lib/api";
-import { getToken, isSessionEphemeral, removeToken, setToken, setUser } from "@/lib/auth";
+import { getToken, getUser, isSessionEphemeral, removeToken, setToken, setUser } from "@/lib/auth";
 import { SceneBoundary } from "@/components/hero/scene-boundary";
+import { reportDiag, tokenFingerprint } from "@/lib/diag";
+import { handoffSession } from "@/lib/session-handoff";
 import { LoginSceneFallback } from "@/components/hero/LoginSceneFallback";
 
 const LoginScene3D = dynamic(() => import("@/components/hero/LoginScene3D").then((m) => m.LoginScene3D), {
@@ -25,7 +27,13 @@ const LoginScene3D = dynamic(() => import("@/components/hero/LoginScene3D").then
  * executing the JavaScript it already has, and no server-side change can reach
  * it — so the screen itself is the only reliable witness. Bump on auth changes.
  */
-const AUTH_BUILD = "auth-fix-3";
+const AUTH_BUILD = "auth-fix-4";
+
+if (typeof window !== "undefined") {
+  // Read by the diagnostics reporter so a log line can be tied to the bundle that
+  // produced it — the question that could not be answered from the server side.
+  (window as any).__VAXBRIDGE_BUILD__ = AUTH_BUILD;
+}
 
 /**
  * The six demonstration accounts, seeded by the API.
@@ -163,16 +171,41 @@ function LoginForm() {
     e.preventDefault();
     setFailure(null);
 
+    // Stage 1: the handler ran at all. Distinguishes "the click did nothing" from
+    // "the click did something that failed later".
+    reportDiag("login.click", {
+      build: AUTH_BUILD,
+      emailLen: form.email.trim().length,
+      passwordLen: form.password.length,
+      submitting,
+      defaultPrevented: e.defaultPrevented,
+    });
+
     if (!form.email.trim() || !form.password) {
+      reportDiag("login.blocked_client_validation", {
+        emailEmpty: !form.email.trim(),
+        passwordEmpty: !form.password,
+      });
       setFailure({ title: "Enter both fields", detail: "An email address and password are required." });
       return;
     }
 
     setSubmitting(true);
+    reportDiag("login.submitting", { apiState: apiState.kind });
     try {
       const res = await API.post("/api/v1/auth/login", {
         email: form.email.trim().toLowerCase(),
         password: form.password,
+      });
+
+      // Stage 2: what the API actually returned. Never the token itself.
+      reportDiag("login.response", {
+        hasRes: !!res,
+        keys: res ? Object.keys(res).join(",") : "none",
+        hasAccessToken: !!res?.access_token,
+        hasUser: !!res?.user,
+        userRole: res?.user?.role ?? null,
+        token: tokenFingerprint(res?.access_token),
       });
 
       // The login response carries the authenticated user, so sign-in completes
@@ -194,7 +227,23 @@ function LoginForm() {
       if (res?.access_token) setToken(res.access_token);
       setUser(me);
 
-      if (res?.access_token && getToken() !== res.access_token) {
+      // Hand the session directly to the shell. In a browser that refuses both
+      // localStorage and third-party cookies, this is the only channel that
+      // survives the client-side navigation to /app — see lib/session-handoff.ts.
+      handoffSession(res?.access_token, me);
+      reportDiag("login.handoff", { hasToken: !!res?.access_token, role: me.role });
+
+      // Stage 3: can the token be read back in THIS tab? This is the exact
+      // question the whole investigation turns on.
+      const readBack = getToken();
+      reportDiag("login.storage", {
+        readBackMatches: readBack === res?.access_token,
+        readBack: tokenFingerprint(readBack),
+        sessionEphemeral: isSessionEphemeral(),
+        userReadable: !!getUser(),
+      });
+
+      if (res?.access_token && readBack !== res.access_token) {
         setStorageBlocked(true);
       }
 
@@ -202,9 +251,16 @@ function LoginForm() {
         variant: "success",
         description: String(me.role || "").replace(/_/g, " "),
       });
+      // Stage 4: navigation is being attempted. If the next line in the log is a
+      // 401 from the app shell, the problem is after this point, not here.
+      reportDiag("login.navigate", { from, method: "router.push+refresh" });
       router.push(from);
       router.refresh();
     } catch (err) {
+      reportDiag("login.error", {
+        message: String((err as Error)?.message || err).slice(0, 200),
+        isNetworkFailure: isNetworkFailure(err),
+      });
       removeToken();
       if (isNetworkFailure(err)) {
         setFailure({

@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { AlertTriangle, Loader2, ShieldCheck, XCircle } from "lucide-react";
 import { API } from "@/lib/api";
+import { handoffSession } from "@/lib/session-handoff";
 import { getToken, isSessionEphemeral, setToken, setUser } from "@/lib/auth";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -97,6 +98,9 @@ export default function RegisterPage() {
       // carries the session, so a browser that refuses this write still works.
       setToken(accessToken);
       setUser(me);
+      // Same handoff as the sign-in page: the shell must not have to recover this
+      // session from storage, which a framed browser may refuse to give back.
+      handoffSession(accessToken, me);
 
       if (getToken() !== accessToken) {
         setStorageBlocked(true);

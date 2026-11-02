@@ -1,6 +1,18 @@
 import { getToken, removeToken } from "./auth";
+import { reportDiag, tokenFingerprint } from "./diag";
+import { secondsSinceSignIn } from "./session-handoff";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "";
+
+/**
+ * How long after a successful sign-in a 401 is treated as a race rather than as
+ * a dead session. Long enough to cover parallel first-paint requests, short
+ * enough that a genuinely expired session still redirects promptly.
+ */
+const SIGN_IN_GRACE_SECONDS = 10;
+
+/** Set once a session-expired redirect starts, so concurrent 401s do not each fire one. */
+let redirecting = false;
 
 async function request(input: RequestInfo, init: RequestInit = {}): Promise<Response> {
   const headers: Record<string, string> = { ...(init.headers as Record<string, string> | undefined) || {} };
@@ -22,13 +34,62 @@ async function request(input: RequestInfo, init: RequestInit = {}): Promise<Resp
   // matters on a cross-origin API_BASE too (the API allows credentials for the
   // configured front-end origins). For the usual same-origin proxy path this is
   // identical to the fetch default, so nothing else changes.
+  // Report the credential actually attached to this request. The server can only
+  // say whether a header arrived; this says what the client believed it was
+  // sending, which is the half of the story that was missing.
+  const diagPath = typeof input === "string" ? input.slice(0, 120) : "non-string-input";
+  reportDiag("api.request", {
+    path: diagPath,
+    method: init.method || "GET",
+    explicitAuth: hasExplicitAuth,
+    storedToken: tokenFingerprint(headers.Authorization ? headers.Authorization.slice(7) : null),
+    willSendAuthHeader: !!headers.Authorization,
+  });
+
   const res = await fetch(input, { credentials: "include", ...init, headers });
+
+  reportDiag("api.response", {
+    path: diagPath,
+    status: res.status,
+    ok: res.ok,
+  });
+
   if (res.status === 401) {
+    const sinceSignIn = secondsSinceSignIn();
+    const onAppPath = typeof window !== "undefined" && window.location.pathname.startsWith("/app");
+    reportDiag("api.401", {
+      path: diagPath,
+      hadAuthHeader: !!headers.Authorization,
+      explicitAuth: hasExplicitAuth,
+      onAppPath,
+      secondsSinceSignIn: sinceSignIn === null ? null : Math.round(sinceSignIn * 10) / 10,
+      redirectSuppressed: sinceSignIn !== null && sinceSignIn < SIGN_IN_GRACE_SECONDS,
+    });
+
+    const withinGrace = sinceSignIn !== null && sinceSignIn < SIGN_IN_GRACE_SECONDS;
+
     // Only clear the stored session when we are not mid-sign-in: a 401 on the
     // verification call is handled by the caller, which still holds the token.
-    if (!hasExplicitAuth) removeToken();
-    if (typeof window !== "undefined" && window.location.pathname.startsWith("/app")) {
-      window.location.href = "/login?session=expired";
+    if (!hasExplicitAuth && !withinGrace) {
+      removeToken();
+    }
+
+    // Session-expired redirect, with two guards that were missing and mattered:
+    //
+    //  * Not during the grace window after a successful sign-in. A request that
+    //    was already in flight can return 401 for want of a token that now
+    //    exists; tearing the session down over it bounced the user back to the
+    //    sign-in page immediately after they had signed in.
+    //  * Only once. Several pages fetch in parallel, so several 401s arrive
+    //    together and each used to trigger its own navigation.
+    //
+    // The app shell owns the authoritative check and redirects on its own; this
+    // is the backstop for a session that dies while the app is in use.
+    if (onAppPath && !withinGrace && !redirecting) {
+      redirecting = true;
+      // `replace` rather than `href =`, so the sign-in page does not become a
+      // history entry the back button would return to mid-redirect.
+      window.location.replace("/login?session=expired");
     }
   }
   return res;

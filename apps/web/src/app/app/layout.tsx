@@ -5,7 +5,9 @@ import { useRouter } from "next/navigation";
 import { OfflineSyncBar } from "@/components/layout/offline-sync-bar";
 import { Sidebar } from "@/components/layout/sidebar";
 import { TopNav } from "@/components/layout/top-nav";
-import { getToken, isAuthenticated, removeToken, setUser } from "@/lib/auth";
+import { getToken, isAuthenticated, removeToken, setToken, setUser } from "@/lib/auth";
+import { consumeHandoff } from "@/lib/session-handoff";
+import { reportDiag, tokenFingerprint } from "@/lib/diag";
 
 type SessionState = "checking" | "ready" | "offline" | "rejected";
 
@@ -32,9 +34,33 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     let cancelled = false;
+    let handoffRetried = false;
 
     async function confirmSession() {
-      const token = getToken();
+      // Take the session the sign-in page handed over before consulting storage.
+      //
+      // In a framed browser that refuses both localStorage and third-party
+      // cookies, storage has nothing to give back and the cookie is not replayed,
+      // so reading them first would report "no session" for a user who signed in
+      // milliseconds ago. The handoff is module state, which a client-side
+      // navigation preserves. See lib/session-handoff.ts.
+      const handoff = consumeHandoff();
+      if (handoff) {
+        if (handoff.token) setToken(handoff.token);
+        setUser(handoff.user);
+        reportDiag("shell.handoff", {
+          hasToken: !!handoff.token,
+          token: tokenFingerprint(handoff.token),
+          role: handoff.user?.role ?? null,
+        });
+      }
+
+      const token = handoff?.token || getToken();
+      reportDiag("shell.confirm_start", {
+        fromHandoff: !!handoff,
+        storedToken: tokenFingerprint(token),
+        locallyAuthenticated: isAuthenticated(),
+      });
 
       // A locally readable token is a convenience, never a precondition.
       //
@@ -49,6 +75,8 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
 
         const res = await fetch("/api/v1/auth/me", { headers, credentials: "include" });
 
+        reportDiag("shell.me_response", { status: res.status, hadToken: !!token });
+
         if (res.ok) {
           const me = await res.json();
           // Refresh the stored profile so a role change is reflected immediately.
@@ -58,8 +86,31 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
         }
 
         if (res.status === 401 || res.status === 403) {
+          // One retry with the token attached explicitly, before giving up. If the
+          // credential came from the handoff it is known-good as of milliseconds
+          // ago, so a 401 here is more likely a lost header than a dead session —
+          // and bouncing straight to the sign-in page is what turned a recoverable
+          // hiccup into "sign-in does not work".
+          if (token && !handoffRetried) {
+            handoffRetried = true;
+            reportDiag("shell.retry_explicit", { token: tokenFingerprint(token) });
+            const retry = await fetch("/api/v1/auth/me", {
+              headers: { Authorization: `Bearer ${token}` },
+              credentials: "include",
+            });
+            reportDiag("shell.retry_response", { status: retry.status });
+            if (retry.ok) {
+              setUser(await retry.json());
+              if (!cancelled) setState("ready");
+              return;
+            }
+          }
+
+          reportDiag("shell.rejected", { status: res.status });
           removeToken();
           if (!cancelled) setState("rejected");
+          // Soft navigation, not `window.location`: a full reload would destroy
+          // the in-memory session and any queued offline captures with it.
           if (!cancelled) router.replace("/login?session=expired");
           return;
         }
@@ -92,6 +143,26 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
         <div className="flex flex-col items-center gap-3">
           <span className="h-8 w-8 animate-spin rounded-full border-4 border-cyan/30 border-t-cyan" />
           <p className="text-sm text-text-secondary">Restoring session…</p>
+        </div>
+      </div>
+    );
+  }
+
+  // A rejected session must NOT render the app. It used to fall through to the
+  // shell below, so the dashboard and its pages mounted during the moment before
+  // `router.replace` took effect. Every one of those requests was unauthenticated
+  // and came back 401, and each 401 triggered the API client's own hard redirect
+  // — a full page reload that raced the shell's soft navigation and destroyed the
+  // in-memory session. The user saw a login page that "would not sign in".
+  if (state === "rejected") {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-navy p-6">
+        <div className="max-w-sm space-y-3 text-center">
+          <p className="font-display text-base font-semibold text-text">Session not recognised</p>
+          <p className="text-xs leading-relaxed text-text-secondary">
+            The server did not accept this session, so nothing was loaded. Taking you back to sign in.
+          </p>
+          <span className="mx-auto block h-6 w-6 animate-spin rounded-full border-2 border-cyan/30 border-t-cyan" />
         </div>
       </div>
     );

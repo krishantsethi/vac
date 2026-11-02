@@ -33,7 +33,7 @@ from .auth import (
     clear_session_cookie,
     SESSION_COOKIE_NAME,
 )
-from .deps import require_user, require_roles, require_capability, DbSession
+from .deps import get_current_user, require_user, require_roles, require_capability, DbSession
 from . import models, schemas
 from . import rbac
 from .inventory import available_quantity, is_expired, is_expiring_soon, is_low_stock
@@ -430,16 +430,30 @@ def register(payload: schemas.UserRegister, response: Response, db: DbSession, r
 
 
 @app.post("/api/v1/auth/logout")
-def logout(response: Response, db: DbSession, request: Request, user: models.User = Depends(require_user)):
+def logout(
+    response: Response,
+    db: DbSession,
+    request: Request,
+    user: Optional[models.User] = Depends(get_current_user),
+):
     """End the session.
 
     Clears the httpOnly cookie. A stateless JWT cannot be revoked server-side
     without a deny-list, so the token itself stays valid until it expires — the
     honest position is to clear the credential the browser will present and to
     say so, rather than to imply the token has been invalidated everywhere.
+
+    Deliberately tolerant of an absent or expired credential. Requiring
+    authentication here means the one case that most needs clearing — a session
+    that has already died — would get a 401 and leave the dead cookie in place,
+    so every later request keeps presenting it. Signing out is idempotent and
+    reveals nothing about whether a session existed, so it always succeeds.
     """
     clear_session_cookie(response, request)
-    _audit(db, user, "logout", "users", user.id, {"email": user.email}, request)
+    if user is not None:
+        _audit(db, user, "logout", "users", user.id, {"email": user.email}, request)
+    else:
+        logger.info("[auth-diag] logout_without_credential path=%s", request.url.path)
     return {"detail": "Signed out on this browser. The issued token expires on its own schedule."}
 
 
@@ -2672,6 +2686,55 @@ def _health_payload(request=None) -> dict:
             "U-WIN, ABDM or any official immunisation registry."
         ),
     }
+
+
+# --------------------------------------------------------------------------- #
+# Client-side diagnostic intake
+#
+# The sign-in failure could only be observed from inside the browser, and the
+# browser console is not visible from here. This endpoint lets the front end
+# report each stage of the flow to the server log, so the exact point of failure
+# can be read rather than inferred.
+#
+# It is unauthenticated by necessity — the whole point is to diagnose a session
+# that cannot be established — and therefore deliberately powerless: it writes a
+# log line and nothing else. No database access, no state change, no echo of the
+# payload to the caller. Size-capped, and the client is required to redact
+# credentials before sending (it sends lengths and booleans, never values).
+# Set AUTH_DIAGNOSTICS=0 to disable it entirely.
+# --------------------------------------------------------------------------- #
+
+CLIENT_DIAG_MAX_BYTES = 4096
+
+
+@app.post("/api/v1/_diag/client")
+async def client_diag(request: Request):
+    if not AUTH_DIAGNOSTICS:
+        return {"recorded": False, "reason": "diagnostics disabled"}
+    try:
+        raw = await request.body()
+    except Exception:
+        return {"recorded": False, "reason": "unreadable body"}
+    if len(raw) > CLIENT_DIAG_MAX_BYTES:
+        raw = raw[:CLIENT_DIAG_MAX_BYTES]
+    try:
+        payload = json.loads(raw or b"{}")
+    except Exception:
+        payload = {"unparsed": raw.decode("utf-8", "replace")[:400]}
+    if not isinstance(payload, dict):
+        payload = {"value": str(payload)[:400]}
+
+    stage = str(payload.pop("stage", "?"))[:60]
+    # Scrub anything that looks like a credential before it reaches the log.
+    for key in ("password", "token", "access_token", "authorization", "cookie", "hash"):
+        payload.pop(key, None)
+    try:
+        flat = json.dumps(payload, default=str, sort_keys=True)[:900]
+    except Exception:
+        flat = str(payload)[:900]
+    ua = (request.headers.get("user-agent") or "-")[:200]
+    print(f"[client-diag] {stage} {flat} ua={ua}", file=sys.stderr, flush=True)
+    return {"recorded": True}
 
 
 @app.get("/health")
