@@ -1,0 +1,29 @@
+{
+  "name": "VAXBRIDGE AI — Immunisation Gap Resolution",
+  "short_name": "VAXBRIDGE",
+  "description": "Turn every vaccination gap into a clear next step. Prototype demonstration with synthetic data; not a government system and not connected to CoWIN, U-WIN or ABDM.",
+  "id": "/",
+  "start_url": "/app",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#07111F",
+  "theme_color": "#0B1728",
+  "categories": ["medical", "productivity", "education"],
+  "lang": "en-IN",
+  "dir": "ltr",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    },
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "maskable"
+    }
+  ]
+}
