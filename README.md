@@ -30,15 +30,16 @@ work, turn it into a task, and resolve it — with every step auditable.
 
 1. [The core idea](#the-core-idea)
 2. [Architecture](#architecture)
-3. [Running it](#running-it)
-4. [Demonstration accounts](#demonstration-accounts)
-5. [Authorization model](#authorization-model)
-6. [Routes](#routes)
-7. [The gap-resolution engine](#the-gap-resolution-engine)
-8. [Offline capture](#offline-capture)
-9. [Testing](#testing)
-10. [What is *not* implemented](#what-is-not-implemented)
-11. [Project layout](#project-layout)
+3. [Production deployment](#production-deployment)
+4. [Running it](#running-it)
+5. [Demonstration accounts](#demonstration-accounts)
+6. [Authorization model](#authorization-model)
+7. [Routes](#routes)
+8. [The gap-resolution engine](#the-gap-resolution-engine)
+9. [Offline capture](#offline-capture)
+10. [Testing](#testing)
+11. [What is *not* implemented](#what-is-not-implemented)
+12. [Project layout](#project-layout)
 
 ---
 
@@ -86,7 +87,7 @@ It is not a medical-risk prediction and must not be read as clinical judgement.
 | Charts | Recharts (2D, for real data — the 3D scene is decorative and never encodes data) |
 
 **Size:** ~9,400 lines of Python (application + tests), ~12,400 lines of TypeScript/TSX, 25 database
-tables, 2 Alembic migrations, 67 API operations (40 GET / 19 POST / 8 PATCH), 29 web routes.
+tables, 3 Alembic migrations, 72 API operations (43 GET / 21 POST / 8 PATCH), 29 web routes.
 
 The API is the authority. The front end never decides authorization — it mirrors the server's
 capability sets **for display only**, so the interface does not offer a destination the server will
@@ -118,6 +119,45 @@ card on the right whose six demonstration accounts live in a `<select>` so none 
 scrolling to reach. Below `lg` it collapses to one column. The scene is imported with
 `dynamic(..., { ssr: false })`, which keeps three.js out of the sign-in critical path — `/login`
 ships 9.48 kB (120 kB first load) and its chunk contains no reference to `WebGLRenderer`.
+
+---
+
+## Production deployment
+
+Two documents cover this in full: **[docs/AUDIT.md](docs/AUDIT.md)** grades every
+feature A–E against the file that proves it, and
+**[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)** records what is provisioned and the
+one step that needs an account owner.
+
+```
+                    Vercel project "vaxbridge"  — one origin
+Browser ──┬── /          Next.js 14 (apps/web)
+          └── /api/v1/*  Python serverless function (api/index.py)
+                          └─ FastAPI ASGI, apps/api/app
+                             ├─► Supabase PostgreSQL 17, role vaxbridge_app (DML only)
+                             └─► Supabase Storage, private bucket, 5-minute signed URLs
+```
+
+**One origin is deliberate.** Hosting the frontend and the API on different
+hostnames makes the session cookie third-party, which is the condition that
+produced this project's recurring login failure. `next.config.mjs` proxies
+`/api/v1/*` only when an API origin is explicitly configured, so production can
+no longer ship a `http://localhost:8000` URL.
+
+The application runs in two modes, and **mode A never depends on a paid key**:
+
+| | Mode A — core | Mode B — enhanced |
+|---|---|---|
+| Trigger | default | a provider key is configured |
+| Auth, patients, vaccinations, scheduling, inventory, analytics, appointments, audit, notifications, offline capture | full | full |
+| Documents | upload, persist, retrieve, human review | same |
+| Extraction | demo fixture, or real Tesseract where the binary exists | same, plus optional model-assisted interpretation |
+| Insights | `/api/v1/insights` — deterministic, always available | same |
+| Generative Q&A | reports unavailable, returns the real records anyway | `/api/v1/ai/ask`, grounded only on retrieved rows |
+
+`GET /api/v1/health` reports the database backend, whether it persists across a
+restart, the storage backend and its durability, and which OCR provider will
+actually run. It never returns a connection string.
 
 ---
 
@@ -456,6 +496,17 @@ queue rather than relying on background sync:
   server decides; `no_session` is reported only on a real 401/403, and the batch is returned to
   `queued` so nothing is stranded or left looking permanently in flight.
 
+**Where the queue lives.** `src/lib/persistent-store.ts` writes to IndexedDB
+first, localStorage second, memory last — in that order because a cross-site
+iframe blocks localStorage outright while IndexedDB is merely partitioned. The
+offline module's API is synchronous and is called during render, so hydration
+fills an in-memory mirror once at startup and writes persist in the background;
+no consumer had to change. When neither store is available the UI says the queue
+is memory-only and will be lost if the page closes, rather than implying a
+captured dose is safe. Values written under the old localStorage-only queue are
+adopted on first hydration, so an upgrade does not silently discard work already
+in the field.
+
 A service worker (`public/sw.js`) keeps the shell reachable: navigations are network-first, build
 assets cache-first, and **`/api/` is never cached** — serving stale clinical data offline would be
 worse than showing an error. It registers in production builds only.
@@ -476,7 +527,7 @@ byte-for-byte and `activate` deletes every cache whose name does not match.
 
 ```bash
 cd apps/api
-python3 -m pytest tests/          # 378 passed
+python3 -m pytest tests/          # 429 passed
 
 # Live end-to-end authentication matrix against the RUNNING app (46 checks).
 # Goes through the web proxy on :3000 — the path a browser actually uses — and
@@ -496,7 +547,8 @@ python3 scripts/verify_auth_e2e.py
 | `test_inventory.py` | 25 | Stock arithmetic, expiry, low-stock and transaction guards |
 | `test_scheduling.py` | 25 | Rule evaluation, statuses, explanation wording |
 | `test_data_integrity.py` | 18 | Population-wide invariants across the seeded data |
-| **Total** | **378** | |
+| Production readiness | 47 | Storage backends, OCR providers, AI honesty, insights, disclosure, serverless startup |
+| **Total** | **429** | |
 
 Notable things the tests assert, because they are easy to get wrong and easy to regress:
 
@@ -525,14 +577,26 @@ Stated plainly, because an honest gap list is more useful than a confident demo.
 
 - No CoWIN, U-WIN, ABDM or any government registry integration. No API client, no credential, no
   stub pretending to be one.
-- No live OCR provider. Extraction is three labeled fixtures. There is no confidence scoring,
-  because the demo provider supplies no calibrated measure and inventing one would be worse than
-  omitting it.
+- **OCR depends on what is installed.** `OCR_PROVIDER` selects between the labeled demo fixture,
+  the open-source Tesseract engine, `none`, and `auto` (Tesseract when genuinely present, otherwise
+  the fixture — and the document records which one ran). Tesseract is free, offline and needs no key,
+  but the binary is **not installed in this environment and cannot be installed on Vercel's Python
+  runtime**, so a serverless deployment falls back to the fixture and says so. Confidence is reported
+  only when the engine supplies it; the fixture measures nothing and therefore reports `None`.
+  `GET /api/v1/health` states the effective provider, so nobody has to guess.
 - No SMS, WhatsApp, email or push provider. Notifications are in-app database rows only; nothing is
   ever delivered to a real device. The `/contact` form writes to `localStorage` and says so on the
   page.
-- No LLM or AI service is called anywhere. "AI" in the product name refers to the deterministic
-  rules engine, which is deliberate: a scheduler must be reproducible.
+- **No AI provider is called by default, and none is required.** `AI_PROVIDER` is `none` unless a
+  key is configured. The optional seam supports OpenAI, Anthropic, Google and any OpenAI-compatible
+  endpoint (including a local Ollama or vLLM, which needs no paid service at all). With no key,
+  `POST /api/v1/ai/ask` returns `ai_available: false`, `text: null` and an explicit reason — but
+  still returns the records it actually retrieved, because those were always real. Nothing is
+  fabricated to fill the gap.
+  `GET /api/v1/insights` is deterministic arithmetic over registry rows and is fully available with
+  no key. It is labelled `engine: deterministic` and never described as AI. "AI" in the product name
+  refers to the rules engine, which is deliberate: a scheduler must be reproducible, and no model may
+  decide a dose.
 
 **Clinical and data scope.**
 
@@ -548,8 +612,13 @@ Stated plainly, because an honest gap list is more useful than a confident demo.
 
 **Platform and security.**
 
-- SQLite, not PostgreSQL, in this environment. The code is database-agnostic and migrations are real,
-  but no PostgreSQL instance was available to test against.
+- **Local development still runs on SQLite.** A managed PostgreSQL 17 (Supabase project
+  `gfoijsgtpenyspnqzcil`) is provisioned with the schema, 44 foreign keys and 39 query indexes
+  applied, and the application connects to it through a least-privilege role with no DDL right. All
+  25 models compile to Postgres DDL and the app contains no raw SQL. What has **not** happened is a
+  full request-level test run against that instance: this sandbox has no network path to it, so the
+  schema was applied and verified through the provider's own SQL interface rather than by exercising
+  the ORM against it. `docs/DEPLOYMENT.md` records exactly what is and is not proven.
 - No refresh tokens, no token revocation list, no MFA, no password reset, and no email verification
   on registration. `POST /auth/logout` clears the session cookie the browser will present, but a
   stateless JWT cannot be revoked without a deny-list: a token already copied elsewhere stays valid
@@ -558,11 +627,19 @@ Stated plainly, because an honest gap list is more useful than a confident demo.
   is keyed by client IP, and there is **no per-account throttling** — so many failures against one
   account from many IPs are not specifically impeded, and one client behind a shared address can
   exhaust the bucket for others. This is why `RATE_LIMIT_AUTH` is 60 rather than a tighter figure.
-- The session cookie is `SameSite=None; Secure`, which is required for the app to work inside a
-  cross-site iframe but also means it is sent on cross-site requests to this origin. A browser with
-  third-party cookies blocked will refuse to store it; the bearer-token path and the in-memory
-  fallback still work in that case, and the sign-in page says which mode it is in.
-- File uploads go to local disk with no object storage, no virus scanning and no CDN.
+  On a serverless platform it is weaker still: each function instance keeps its own counters, so the
+  limit is best-effort across a fleet. A hard guarantee needs a shared store or an edge-level limit.
+- The session cookie is `SameSite=None; Secure; Partitioned`. `None` is required for the app to work
+  inside a cross-site iframe, which also means it is sent on cross-site requests to this origin;
+  `Partitioned` (CHIPS) keys the jar to the top-level site, which is what lets the cookie exist at all
+  where third-party cookies are blocked. Where a browser supports neither, the bearer-token path, the
+  in-memory fallback and the session handoff still work, and the sign-in page says which mode it is
+  in. Deployed top-level on its own domain — the intended production shape — the cookie is
+  first-party and none of this applies.
+- **Uploads have two backends.** `STORAGE_BACKEND=local` writes to disk (the default, and not
+  durable on serverless); `supabase` uses a private Supabase Storage bucket with 5-minute signed URLs,
+  and is what the Vercel project is configured with. There is still **no virus scanning and no CDN**,
+  and no asynchronous processing queue — OCR runs inside the request, bounded by `OCR_TIMEOUT_SECONDS`.
 - The signed record QR is an HMAC over the summary using a server-side secret. It confirms
   integrity and expiry but it is **not** a public-key credential: there is no certificate chain, no
   issuer directory, and verification requires reaching this server. It is not recognised by any
@@ -576,7 +653,7 @@ Stated plainly, because an honest gap list is more useful than a confident demo.
   match reality.
 - **No automated frontend tests.** No Playwright, Cypress or Jest suite exists. The UI is verified by
   type-checking, a clean production build and manual route/API checks — which is materially weaker
-  than the backend's 378 tests.
+  than the backend's 429 tests.
 - No real-time updates (no WebSocket or SSE). Pages fetch on load and on explicit refresh.
 - Accessibility is implemented (semantic landmarks, focus states, `aria` attributes, reduced-motion
   support, keyboard-reachable controls) but has **not** been verified with assistive technology or an
@@ -600,7 +677,11 @@ Stated plainly, because an honest gap list is more useful than a confident demo.
 apps/
 ├── api/
 │   ├── app/
-│   │   ├── main.py            # 67 API operations, RBAC gates, audit, seeding
+│   │   ├── ai.py              # optional provider seam; never fabricates a response
+│   │   ├── insights.py        # deterministic figures from real rows, no key needed
+│   │   ├── main.py            # 72 API operations, RBAC gates, audit, seeding
+│   │   ├── ocr.py             # demo | tesseract | auto | none
+│   │   ├── storage.py         # local filesystem or private Supabase bucket
 │   │   ├── models.py          # 25 tables
 │   │   ├── schemas.py         # Pydantic v2 contracts + field validators
 │   │   ├── rbac.py            # capability sets, fail-closed patient scoping
@@ -614,7 +695,12 @@ apps/
 │   │   ├── inventory.py       # single source of stock arithmetic
 │   │   └── scheduling/engine.py
 │   ├── alembic/               # 2 migrations
-│   ├── tests/                 # 378 tests
+│   ├── tests/                 # 429 tests
+│   └── ...
+├── api/                       # Vercel Python function entrypoint + its requirements
+├── docs/                      # AUDIT.md (feature grading), DEPLOYMENT.md (provisioning)
+├── scripts/                   # verify_auth_e2e.py — live authentication matrix
+└── vercel.json                # single-origin build: Next.js app + FastAPI function
 │   └── vaxbridge_demo.db
 └── web/
     ├── public/                # manifest, icon, service worker
