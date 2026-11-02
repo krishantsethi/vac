@@ -37,8 +37,13 @@ def _diag(reason: str, request: Request | None, token: str | None = None, extra:
         parts.append("token=absent")
     if request is not None:
         parts.append(f"path={request.url.path}")
+        # Truncated at 200, not the ~110 a real Chrome UA needs: this suite's own
+        # verification script appends a marker to a browser-like UA so its
+        # deliberate 401 cases can be told apart from a genuine browser failing to
+        # sign in. A shorter cut removed the marker and made the two
+        # indistinguishable, which defeats the purpose of logging the UA at all.
         ua = request.headers.get("user-agent") or "-"
-        parts.append(f"ua={ua[:110]}")
+        parts.append(f"ua={ua[:200]}")
         parts.append(f"has_auth_header={'authorization' in request.headers}")
         parts.append(f"origin={request.headers.get('origin') or '-'}")
     if extra:

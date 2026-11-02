@@ -207,7 +207,7 @@ def _diag_login(request: Request, stage: str, email: str = "", user_id: str = ""
         parts.append(f"user_id={user_id}")
     if request is not None:
         ua = request.headers.get("user-agent") or "-"
-        parts.append(f"ua={ua[:110]}")
+        parts.append(f"ua={ua[:200]}")
         parts.append(f"origin={request.headers.get('origin') or '-'}")
     print(" ".join(parts), file=sys.stderr, flush=True)
 

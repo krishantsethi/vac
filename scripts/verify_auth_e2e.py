@@ -36,7 +36,13 @@ import json, os, urllib.request, urllib.error, datetime, sys, time
 from jose import jwt
 
 B = os.getenv("BASE", "http://127.0.0.1:3000/api/v1")
-UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36"
+# Carries an explicit marker. This script originally impersonated a real Chrome
+# user-agent exactly, which made its deliberate 401 cases indistinguishable in the
+# server log from a genuine browser failing to sign in — the one thing the
+# AUTH_DIAGNOSTICS output exists to separate. The marker costs nothing and makes
+# `grep auth-diag /tmp/api.log | grep -v VAXBRIDGE-E2E` show only real traffic.
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+      "Chrome/156.0.0.0 Safari/537.36 VAXBRIDGE-E2E/1.0")
 SECRET = "dev-secret-change-in-production"
 RUN = os.getenv("E2E_RUN_ID", str(int(time.time()))[-6:])
 
