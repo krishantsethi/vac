@@ -477,6 +477,12 @@ byte-for-byte and `activate` deletes every cache whose name does not match.
 ```bash
 cd apps/api
 python3 -m pytest tests/          # 378 passed
+
+# Live end-to-end authentication matrix against the RUNNING app (46 checks).
+# Goes through the web proxy on :3000 — the path a browser actually uses — and
+# covers every demo role, all credential-rejection cases, cookie-only session
+# restoration, the stale-client failure mode, and the escalation refusal.
+python3 scripts/verify_auth_e2e.py
 ```
 
 | File | Tests | Covers |
