@@ -82,26 +82,26 @@ export default function RegisterPage() {
         throw new Error("The API did not return an access token.");
       }
       const accessToken: string = res.access_token;
-      setToken(accessToken);
 
-      // Verified with the token in hand rather than read back from storage: when
-      // a browser partitions or blocks localStorage the read can return null, and
-      // the request would go out unauthenticated even though the account was just
-      // created successfully.
-      const me: any = await API.getWithToken("/api/v1/auth/me", accessToken);
+      // The register response carries the new account, so this completes in one
+      // round-trip. Falling back to /auth/me only if it does not keeps the page
+      // working against an older API. The token is passed explicitly there rather
+      // than read back from storage, which can return null in a browser that
+      // partitions or blocks it.
+      const me: any = res.user ?? (await API.getWithToken("/api/v1/auth/me", accessToken));
       if (!me?.id) {
         throw new Error("Your account was created, but the session could not be confirmed.");
       }
+
+      // Best-effort local copy. The httpOnly cookie the API set is what actually
+      // carries the session, so a browser that refuses this write still works.
+      setToken(accessToken);
       setUser(me);
 
       if (getToken() !== accessToken) {
         setStorageBlocked(true);
-        toast("Account created. This browser is blocking stored sessions, so you will need to sign in again after a reload.", {
-          variant: "warning",
-        });
-      } else {
-        toast(`Account created — welcome, ${me.full_name || me.email}`, { variant: "success" });
       }
+      toast(`Account created — welcome, ${me.full_name || me.email}`, { variant: "success" });
       router.push("/app");
       router.refresh();
     } catch (err: any) {
@@ -137,7 +137,7 @@ export default function RegisterPage() {
           <div className="flex items-start gap-3 rounded-lg border border-amber-500/30 bg-amber-500/8 p-4 text-sm">
             <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" aria-hidden />
             <div className="space-y-1">
-              <p className="font-medium text-text">This browser is blocking stored sessions</p>
+              <p className="font-medium text-text">This browser blocks script-accessible storage</p>
               <p className="text-xs leading-relaxed text-text-secondary">
                 Registration still works and the session is kept in memory for this tab, but it will
                 not survive a reload. This usually happens when the app is embedded in a frame or

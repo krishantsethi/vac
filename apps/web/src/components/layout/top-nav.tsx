@@ -26,6 +26,7 @@ const TITLES: { match: string; title: string }[] = [
 
 export function TopNav({ onMenu }: { onMenu: () => void }) {
   const [menuOpen, setMenuOpen] = useState(false);
+  const [signingOut, setSigningOut] = useState(false);
   const [bellOpen, setBellOpen] = useState(false);
   const [notifications, setNotifications] = useState<any[]>([]);
   const [lang, setLang] = useState<"en" | "hi">("en");
@@ -66,7 +67,13 @@ export function TopNav({ onMenu }: { onMenu: () => void }) {
 
   const unread = notifications.filter((n) => !n.is_read).length;
 
-  const handleSignOut = () => {
+  const handleSignOut = async () => {
+    // The session lives in an httpOnly cookie as well as in local storage, and
+    // JavaScript cannot delete that cookie. Asking the API to clear it is what
+    // actually ends the session — dropping only the local token would leave the
+    // cookie valid, so the next /auth/me would silently sign the user back in.
+    setSigningOut(true);
+    await API.logout();
     removeToken();
     router.push("/login");
   };

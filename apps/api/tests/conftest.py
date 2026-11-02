@@ -24,6 +24,12 @@ os.environ["UPLOAD_DIR"] = str(_TEST_DIR / "uploads")
 # sliding-window limiter so it cannot cause spurious 429 failures.
 os.environ["RATE_LIMIT_DEFAULT"] = "1000000"
 os.environ["RATE_LIMIT_AUTH"] = "1000000"
+# TestClient talks plain http://testserver, and a Secure cookie over plaintext is
+# correctly discarded by any compliant client. Clearing the flag here is what
+# lets the cookie path be exercised at all; the production default stays Secure,
+# and the attribute itself is asserted separately in test_security.py.
+os.environ["SESSION_COOKIE_SECURE"] = "0"
+os.environ["SESSION_COOKIE_SAMESITE"] = "lax"
 
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
@@ -52,6 +58,26 @@ def client():
     """TestClient whose startup event creates and seeds the schema."""
     with TestClient(app) as c:
         yield c
+
+
+@pytest.fixture(autouse=True)
+def _isolate_session_cookies(client):
+    """Give every test a clean cookie jar.
+
+    The client is session-scoped for speed, and so is its cookie jar. That was
+    harmless while the only credential was a bearer token each test had to pass
+    explicitly. Introducing the httpOnly session cookie made the shared state
+    visible: `tokens` signs in every demo role at session start, so the jar would
+    otherwise carry a real session into tests that intend to be anonymous. A test
+    asserting "rejects anonymous" would then fail — or worse, pass for the wrong
+    reason while a genuine leak went unnoticed.
+
+    Clearing on both sides keeps each test's credentials explicit and makes any
+    cookie it relies on one it established itself.
+    """
+    client.cookies.clear()
+    yield
+    client.cookies.clear()
 
 
 @pytest.fixture(scope="session")

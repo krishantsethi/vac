@@ -17,7 +17,12 @@ async function request(input: RequestInfo, init: RequestInit = {}): Promise<Resp
     if (token) headers.Authorization = `Bearer ${token}`;
   }
 
-  const res = await fetch(input, { ...init, headers });
+  // `include` so the httpOnly session cookie rides along. It is what keeps a
+  // session alive in a browser that refuses script-accessible storage, and it
+  // matters on a cross-origin API_BASE too (the API allows credentials for the
+  // configured front-end origins). For the usual same-origin proxy path this is
+  // identical to the fetch default, so nothing else changes.
+  const res = await fetch(input, { credentials: "include", ...init, headers });
   if (res.status === 401) {
     // Only clear the stored session when we are not mid-sign-in: a 401 on the
     // verification call is handled by the caller, which still holds the token.
@@ -75,6 +80,20 @@ export const API = {
       body: body ? JSON.stringify(body) : undefined,
     }),
   delete: (path: string) => api<any>(`${API_BASE}${path}`, { method: "DELETE" }),
+  /**
+   * End the session server-side (clears the httpOnly cookie) and locally.
+   *
+   * The API call is best-effort: if it fails, the local credential is still
+   * dropped, because leaving a token behind on sign-out is worse than a cookie
+   * that expires on its own schedule.
+   */
+  logout: async () => {
+    try {
+      await api<any>(`${API_BASE}/api/v1/auth/logout`, { method: "POST" });
+    } catch {
+      // Ignored deliberately — local sign-out below still happens.
+    }
+  },
   postForm: async (path: string, formData: FormData) => {
     const token = getToken();
     const headers: Record<string, string> = {};

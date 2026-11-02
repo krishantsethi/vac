@@ -34,16 +34,20 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
     let cancelled = false;
 
     async function confirmSession() {
-      if (!isAuthenticated()) {
-        if (!cancelled) router.replace("/login");
-        return;
-      }
-
       const token = getToken();
+
+      // A locally readable token is a convenience, never a precondition.
+      //
+      // The session may exist only as the httpOnly cookie the API set at sign-in,
+      // which JavaScript cannot read by design. Bailing out here on a missing
+      // local token would sign out exactly the users whose browser refuses
+      // script-accessible storage — and would do so on every page refresh, which
+      // empties the in-memory fallback. So the server is always asked.
       try {
-        const res = await fetch("/api/v1/auth/me", {
-          headers: { Authorization: `Bearer ${token}` },
-        });
+        const headers: Record<string, string> = {};
+        if (token) headers.Authorization = `Bearer ${token}`;
+
+        const res = await fetch("/api/v1/auth/me", { headers, credentials: "include" });
 
         if (res.ok) {
           const me = await res.json();
@@ -64,8 +68,15 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
         // misleading sign-in redirect; individual pages report their own errors.
         if (!cancelled) setState("ready");
       } catch {
-        // Network failure. Keep the session and render in offline mode.
-        if (!cancelled) setState("offline");
+        // Network failure, so the server cannot be asked. With a locally valid
+        // token, render in offline mode so captures queued on this device stay
+        // visible and can be synced later — being offline must not look like
+        // being signed out. With no token there is nothing to show offline.
+        if (isAuthenticated()) {
+          if (!cancelled) setState("offline");
+        } else if (!cancelled) {
+          router.replace("/login");
+        }
       }
     }
 

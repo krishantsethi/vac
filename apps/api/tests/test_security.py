@@ -11,6 +11,8 @@ them are regression tests for real holes found while building the app:
   "system administrator" an unrestricted clinical superuser.
 """
 
+import uuid
+
 import pytest
 
 from app import models
@@ -54,6 +56,11 @@ def test_login_rejects_malformed_body(client):
 
 
 def test_tampered_token_is_rejected(client, tokens):
+    # Cookies cleared: the `tokens` fixture signs in through this client and
+    # leaves a valid session cookie behind, which would otherwise authenticate
+    # the request by fallback and hide what this test is actually checking —
+    # that a tampered bearer signature never validates.
+    client.cookies.clear()
     good = tokens["clinic_admin"]
     # Flip a character in the signature segment.
     head, payload, sig = good.split(".")
@@ -63,8 +70,29 @@ def test_tampered_token_is_rejected(client, tokens):
 
 
 def test_token_for_wrong_scheme_is_rejected(client, tokens):
+    """A raw token with no Bearer prefix is not an acceptable header credential.
+
+    Cookies are cleared first: the `tokens` fixture signs in through this client,
+    which leaves a valid session cookie in the jar, and a valid cookie *should*
+    authenticate the request regardless of a malformed header. Isolating the
+    header is the only way to assert anything about it.
+    """
+    client.cookies.clear()
     r = client.get("/api/v1/patients?page_size=1", headers={"Authorization": tokens["clinic_admin"]})
     assert r.status_code == 401
+
+
+def test_valid_cookie_still_authenticates_when_the_header_is_malformed(client, tokens):
+    """The intended interaction, pinned so it is not mistaken for a bug.
+
+    A malformed Authorization header does not cancel a valid session cookie. The
+    cookie is a credential in its own right, and refusing it here would sign out
+    any client that also sent a stale or broken header.
+    """
+    _login(client)  # establishes the session cookie
+    r = client.get("/api/v1/auth/me", headers={"Authorization": "Bearer not-a-real-token"})
+    assert r.status_code == 200, r.text
+    assert r.json()["email"] == "clinic@vaxbridge.demo"
 
 
 def test_auth_me_returns_caller_identity(client, tokens):
@@ -473,3 +501,259 @@ def test_provisioned_account_password_is_not_stored_in_plaintext(client, tokens,
     assert user is not None
     assert user.password_hash != "Provision@123"
     assert "Provision@123" not in (user.password_hash or "")
+
+
+# --------------------------------------------------------------------------- #
+# Session cookie
+#
+# Sign-in used to require a second, authenticated round-trip to /auth/me. That
+# call was the first to depend on the client having stored and replayed the
+# token, so in a browser that refuses script-accessible storage it went out with
+# no credential at all and an accepted password produced "Not authenticated".
+# The httpOnly cookie set at login makes the session independent of that.
+# --------------------------------------------------------------------------- #
+
+COOKIE = "vaxbridge_session"
+
+
+def _login(client, email="clinic@vaxbridge.demo", password="Clinic@12345"):
+    return client.post("/api/v1/auth/login", json={"email": email, "password": password})
+
+
+def test_login_sets_an_httponly_session_cookie(client):
+    """Attributes that hold in every configuration."""
+    r = _login(client)
+    assert r.status_code == 200
+    raw = r.headers.get("set-cookie", "")
+    assert f"{COOKIE}=" in raw
+    assert "httponly" in raw.lower(), "session cookie must not be readable by JavaScript"
+    assert "path=/" in raw.lower()
+
+
+def test_production_cookie_is_secure_and_cross_site(client, monkeypatch):
+    """The shipped configuration, asserted through the real endpoint.
+
+    conftest clears Secure/SameSite=None so the plain-HTTP TestClient will store
+    the cookie at all, so the production values are restored here explicitly.
+    SameSite=None is required because the app is normally framed by another site,
+    where a Lax cookie would be dropped from every fetch; browsers honour None
+    only together with Secure.
+    """
+    from app import auth
+    monkeypatch.setattr(auth, "SESSION_COOKIE_SECURE", "true")
+    monkeypatch.setattr(auth, "SESSION_COOKIE_SAMESITE", "none")
+    raw = _login(client).headers.get("set-cookie", "").lower()
+    assert "secure" in raw
+    assert "samesite=none" in raw
+    assert "httponly" in raw
+
+
+def test_secure_flag_honours_an_explicit_setting(monkeypatch):
+    from app import auth
+    for value, expected in [("1", True), ("true", True), ("0", False), ("false", False)]:
+        monkeypatch.setattr(auth, "SESSION_COOKIE_SECURE", value)
+        assert auth.cookie_secure_flag(None) is expected, value
+
+
+def test_secure_flag_in_auto_mode_reads_the_forwarded_proto(monkeypatch):
+    """The browser's scheme, not the proxy-to-API hop, decides the flag."""
+    from app import auth
+
+    class _URL:
+        scheme = "http"
+
+    class _Req:
+        url = _URL()
+        def __init__(self, headers): self.headers = headers
+
+    monkeypatch.setattr(auth, "SESSION_COOKIE_SECURE", "auto")
+    assert auth.cookie_secure_flag(_Req({"x-forwarded-proto": "https"})) is True
+    assert auth.cookie_secure_flag(_Req({"x-forwarded-proto": "http"})) is False
+    # Leftmost entry wins when a chain of proxies appended to the header.
+    assert auth.cookie_secure_flag(_Req({"x-forwarded-proto": "https, http"})) is True
+    # No forwarding information: fall back to the direct connection scheme.
+    assert auth.cookie_secure_flag(_Req({})) is False
+
+
+def test_login_returns_the_authenticated_user(client):
+    """Sign-in must complete in one round-trip."""
+    body = _login(client).json()
+    assert body["token_type"] == "bearer"
+    assert body["access_token"]
+    user = body["user"]
+    assert user["email"] == "clinic@vaxbridge.demo"
+    assert user["role"] == "clinic_admin"
+    assert user["is_active"] is True
+    # The password hash must never leave the server.
+    assert "password_hash" not in user
+    assert "password" not in user
+
+
+def test_cookie_alone_authenticates_a_protected_route(client):
+    """No Authorization header at all — the exact request that used to fail."""
+    _login(client)
+    client.headers.pop("Authorization", None)
+    r = client.get("/api/v1/auth/me", headers={"Authorization": ""})
+    assert r.status_code == 200, r.text
+    assert r.json()["email"] == "clinic@vaxbridge.demo"
+
+
+def test_cookie_alone_reaches_clinical_data(client):
+    _login(client)
+    r = client.get("/api/v1/patients?page_size=5")
+    assert r.status_code == 200
+    assert r.json()["total"] > 0
+
+
+def test_bearer_token_still_authenticates(client):
+    """The cookie is additive; the documented bearer flow must not regress."""
+    token = _login(client).json()["access_token"]
+    client.cookies.clear()
+    r = client.get("/api/v1/auth/me", headers=auth(token))
+    assert r.status_code == 200
+    assert r.json()["email"] == "clinic@vaxbridge.demo"
+
+
+def test_bearer_takes_precedence_over_cookie(client):
+    """An explicit token must win, so a stale cookie cannot override it."""
+    clinic_token = _login(client).json()["access_token"]          # sets clinic cookie
+    worker_token = _login(client, "worker1@vaxbridge.demo", "Worker@12345").json()["access_token"]
+    r = client.get("/api/v1/auth/me", headers=auth(clinic_token))
+    assert r.json()["email"] == "clinic@vaxbridge.demo"
+    assert r.json()["email"] != "worker1@vaxbridge.demo"
+    assert worker_token != clinic_token
+
+
+def test_absent_credentials_are_refused(client):
+    client.cookies.clear()
+    r = client.get("/api/v1/auth/me")
+    assert r.status_code == 401
+    assert r.json()["detail"] == "Not authenticated"
+
+
+def test_garbage_cookie_is_refused(client):
+    client.cookies.clear()
+    client.cookies.set(COOKIE, "not-a-jwt")
+    assert client.get("/api/v1/auth/me").status_code == 401
+
+
+def test_tampered_cookie_signature_is_refused(client):
+    token = _login(client).json()["access_token"]
+    # Clear the good cookie the login just stored, or it would be sent alongside
+    # the tampered one and authenticate the request.
+    client.cookies.clear()
+    client.cookies.set(COOKIE, token[:-6] + "AAAAAA")
+    assert client.get("/api/v1/auth/me").status_code == 401
+
+
+def test_cookie_signed_with_a_different_secret_is_refused(client):
+    from datetime import datetime, timedelta, timezone
+    from jose import jwt as jose_jwt
+    now = datetime.now(timezone.utc)
+    forged = jose_jwt.encode(
+        {"sub": "anything", "iat": int(now.timestamp()),
+         "exp": int((now + timedelta(days=1)).timestamp())},
+        "a-completely-different-secret", algorithm="HS256",
+    )
+    client.cookies.clear()
+    client.cookies.set(COOKIE, forged)
+    assert client.get("/api/v1/auth/me").status_code == 401
+
+
+def test_expired_cookie_is_refused(client):
+    from datetime import datetime, timedelta, timezone
+    from jose import jwt as jose_jwt
+    from app.auth import SECRET_KEY
+    now = datetime.now(timezone.utc)
+    expired = jose_jwt.encode(
+        {"sub": "x", "iat": int((now - timedelta(days=2)).timestamp()),
+         "exp": int((now - timedelta(days=1)).timestamp())},
+        SECRET_KEY, algorithm="HS256",
+    )
+    client.cookies.clear()
+    client.cookies.set(COOKIE, expired)
+    assert client.get("/api/v1/auth/me").status_code == 401
+
+
+def test_cookie_for_a_deleted_account_is_refused(client, db):
+    """A valid signature is not sufficient; the account must still exist."""
+    from datetime import datetime, timedelta, timezone
+    from jose import jwt as jose_jwt
+    from app.auth import SECRET_KEY
+    now = datetime.now(timezone.utc)
+    token = jose_jwt.encode(
+        {"sub": "00000000-0000-0000-0000-000000000000", "iat": int(now.timestamp()),
+         "exp": int((now + timedelta(days=1)).timestamp())},
+        SECRET_KEY, algorithm="HS256",
+    )
+    client.cookies.clear()
+    client.cookies.set(COOKIE, token)
+    assert client.get("/api/v1/auth/me").status_code == 401
+
+
+def test_disabled_account_cannot_authenticate(client, db):
+    from app import models
+    user = db.query(models.User).filter(models.User.email == "worker2@vaxbridge.demo").first()
+    user.is_active = False
+    db.commit()
+    r = client.post("/api/v1/auth/login", json={
+        "email": "worker2@vaxbridge.demo", "password": "Worker@12345",
+    })
+    assert r.status_code == 403
+    assert r.json()["detail"] == "Account disabled"
+    assert "access_token" not in r.json()
+    user.is_active = True
+    db.commit()
+
+
+def test_failed_login_sets_no_cookie(client):
+    r = client.post("/api/v1/auth/login", json={
+        "email": "clinic@vaxbridge.demo", "password": "WrongPassword1",
+    })
+    assert r.status_code == 401
+    assert COOKIE not in r.headers.get("set-cookie", "")
+
+
+def test_failed_login_does_not_reveal_which_factor_failed(client):
+    wrong_password = client.post("/api/v1/auth/login", json={
+        "email": "clinic@vaxbridge.demo", "password": "WrongPassword1"})
+    unknown_email = client.post("/api/v1/auth/login", json={
+        "email": "nobody@vaxbridge.demo", "password": "WrongPassword1"})
+    assert wrong_password.status_code == unknown_email.status_code == 401
+    assert wrong_password.json()["detail"] == unknown_email.json()["detail"]
+
+
+def test_logout_clears_the_session_cookie(client):
+    _login(client)
+    assert client.get("/api/v1/auth/me").status_code == 200
+    r = client.post("/api/v1/auth/logout")
+    assert r.status_code == 200
+    raw = r.headers.get("set-cookie", "")
+    assert COOKIE in raw
+    assert '""' in raw or "max-age=0" in raw.lower() or "expires=" in raw.lower()
+
+
+def test_login_after_logout_works(client):
+    _login(client)
+    client.post("/api/v1/auth/logout")
+    r = _login(client)
+    assert r.status_code == 200
+    assert client.get("/api/v1/auth/me").status_code == 200
+
+
+def test_registration_also_establishes_a_session(client):
+    r = client.post("/api/v1/auth/register", json={
+        "email": f"cookie_reg_{uuid.uuid4().hex[:8]}@vaxbridge.demo",
+        "password": "Valid@12345", "full_name": "Cookie Reg", "role": "patient",
+    })
+    assert r.status_code == 200, r.text
+    assert f"{COOKIE}=" in r.headers.get("set-cookie", "")
+    assert r.json()["user"]["role"] == "patient"
+    assert client.get("/api/v1/auth/me").status_code == 200
+
+
+def test_api_responses_are_not_cacheable(client):
+    """Immunisation records and credentials must never be replayed from a cache."""
+    for path in ("/api/v1/health", "/api/v1/auth/me"):
+        cc = client.get(path).headers.get("cache-control", "")
+        assert "no-store" in cc, f"{path} missing no-store: {cc!r}"

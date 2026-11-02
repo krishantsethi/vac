@@ -86,7 +86,7 @@ It is not a medical-risk prediction and must not be read as clinical judgement.
 | Charts | Recharts (2D, for real data — the 3D scene is decorative and never encodes data) |
 
 **Size:** ~9,400 lines of Python (application + tests), ~12,400 lines of TypeScript/TSX, 25 database
-tables, 2 Alembic migrations, 66 API operations (40 GET / 18 POST / 8 PATCH), 29 web routes.
+tables, 2 Alembic migrations, 67 API operations (40 GET / 19 POST / 8 PATCH), 29 web routes.
 
 The API is the authority. The front end never decides authorization — it mirrors the server's
 capability sets **for display only**, so the interface does not offer a destination the server will
@@ -144,8 +144,27 @@ npm run dev          # http://localhost:3000, binds 0.0.0.0
 | `RECORD_TTL_SECONDS` | `2592000` (30 days) | How long a signed record link stays valid |
 | `OCR_DEMO_MODE` | `true` | Runs the labeled fixture extractor |
 | `UPLOAD_DIR` | `./uploads` | Where uploaded documents are written |
-| `RATE_LIMIT_DEFAULT` / `RATE_LIMIT_AUTH` | 600 / 20 | Requests per window |
+| `RATE_LIMIT_DEFAULT` / `RATE_LIMIT_AUTH` | 600 / 60 | Requests per 60-second window |
+| `TRUST_PROXY_HEADERS` | `1` | Honour `X-Forwarded-For` when identifying clients for rate limiting |
+| `SESSION_COOKIE_NAME` | `vaxbridge_session` | Name of the httpOnly session cookie |
+| `SESSION_COOKIE_SECURE` | `true` | `true`/`false`, or `auto` to derive from `X-Forwarded-Proto` |
+| `SESSION_COOKIE_SAMESITE` | `none` | `none` is required for the app to work inside a cross-site iframe |
+| `AUTH_DIAGNOSTICS` | `1` | Log the stage at which an authentication was rejected |
 | `NEXT_PUBLIC_API_URL` | *(empty)* | Empty means "same origin", proxied by `next.config.mjs` |
+
+Two of these deserve a note.
+
+**`RATE_LIMIT_AUTH` is 60, not 20.** This service normally sits behind a reverse proxy that presents
+every request from one loopback address, so an IP-keyed bucket is shared by everyone reaching the app
+through it. At 20/minute a handful of sign-in retries by one person could lock out every other user
+of the instance. 60/minute still makes online password guessing impractical. The per-account
+throttling that would allow a lower figure again is **not implemented** and is listed under
+[What is *not* implemented](#what-is-not-implemented).
+
+**`TRUST_PROXY_HEADERS` is on by default** because without it every client behind the proxy shares a
+single rate-limit bucket. Honouring `X-Forwarded-For` from an *untrusted* peer would let a caller
+rotate the header and get a fresh bucket per request, so this must be turned off if the API is ever
+exposed directly to the internet rather than behind a proxy that sets the header itself.
 
 ### Resetting the demonstration data
 
@@ -243,27 +262,69 @@ Accounts created in this build are **not email-verified** (`is_verified=False` f
 Nothing depends on that flag yet, and the registration page says so rather than implying a
 confirmation email is on its way.
 
-### Session storage
+### Session architecture
 
-The session is a JWT held in `localStorage`, read by `src/lib/auth.ts`. Every access is wrapped and
-every write is verified by reading it back, with an in-memory fallback for the current tab.
+A session is a JWT signed with `VAULT_SECRET_KEY` (HS256, 30-day expiry). It reaches the server by
+**either** of two credentials, tried in this order:
 
-This is not defensive decoration. Browsers partition or block `localStorage` in cross-site frames —
-which is exactly how a preview host serves this app — and under those restrictions a write can
-succeed while the following read returns `null`. The visible symptom was total: `POST /auth/login`
-returned **200** with a valid token, the next request went out with no `Authorization` header, and
-the server answered **401 "Not authenticated"**. Users were told sign-in failed when their
-credentials had been accepted.
+1. `Authorization: Bearer <token>` — the documented API contract, used by scripts and tests.
+2. `vaxbridge_session`, an **httpOnly** cookie set by `POST /auth/login` and `/auth/register`.
 
-Two changes remove the failure mode:
+`get_current_user` in `app/deps.py` tries the bearer first and, if it fails to decode, falls back to
+the cookie rather than rejecting outright. A client that cannot read its own storage may still be
+presenting a stale token it cached earlier; treating that header as authoritative would sign the
+user out for a bug they can neither see nor fix. Every rejected credential is logged with the branch
+that rejected it (`AUTH_DIAGNOSTICS`, on by default), so the fallback is observable rather than
+silent — while the response stays a single opaque 401, because which credential failed and why is
+useful to an attacker and not to a client.
 
-- The sign-in and sign-up flows confirm the session with the token **they are already holding**
-  (`API.getWithToken`) instead of reading it back from storage.
-- `request()` in `src/lib/api.ts` never overwrites an explicitly supplied `Authorization` header.
+Cookie attributes are `HttpOnly; Secure; SameSite=None; Path=/`.
 
-When storage is genuinely unavailable the app still works for the tab, and both pages say so in a
-banner instead of letting a later reload look like an unexplained sign-out. A session does not
-survive a reload in that state — stated plainly rather than papered over.
+- **`SameSite=None`** because the app is normally opened inside an iframe on a different registrable
+  domain from the one serving it. Requests the page makes to its own API are then *cross-site* in the
+  SameSite sense — the site that matters is the top-level document's, not the iframe's — and a `Lax`
+  cookie would be silently dropped from every `fetch`. `None` is honoured by browsers only together
+  with `Secure`, hence both.
+- **`HttpOnly`** so the token cannot be read by script, which makes it strictly harder to exfiltrate
+  than a token in `localStorage`.
+- Override with `SESSION_COOKIE_SECURE=0` and `SESSION_COOKIE_SAMESITE=lax` for a plain-HTTP
+  deployment that is not framed by another site. `SESSION_COOKIE_SECURE=auto` derives the flag from
+  `X-Forwarded-Proto`, but note that the Next.js rewrite proxy used here does **not** forward that
+  header, so auto-detection cannot see the browser's real scheme and the default is explicit.
+
+**Sign-in completes in one round-trip.** `POST /auth/login` returns
+`{access_token, token_type, user}`, so the client never needs a second authenticated call to learn
+who it is. That second call — to `/auth/me` — was where sign-in repeatedly broke: it was the first
+request to depend on the client having stored *and replayed* the token, and in a browser that
+refuses script-accessible storage it went out with no credential at all, turning an accepted
+password into `401 "Not authenticated"`. `/auth/me` still exists and is still used to restore a
+session on page load.
+
+`src/lib/auth.ts` additionally wraps every `localStorage` access and verifies each write by reading
+it back, falling back to in-memory storage for the tab. The app shell (`src/app/app/layout.tsx`)
+always asks the server rather than requiring a locally readable token first, so a cookie-only
+session survives a refresh.
+
+**Sign-out calls `POST /auth/logout`.** JavaScript cannot delete an httpOnly cookie, so clearing only
+the local token would leave the session alive and the next `/auth/me` would sign the user straight
+back in. A stateless JWT cannot be revoked server-side without a deny-list, so the endpoint clears
+the credential the browser will present and says plainly that the token itself expires on its own
+schedule — it does not claim to have invalidated it everywhere.
+
+### Authentication diagnostics
+
+`AUTH_DIAGNOSTICS=1` (default) writes one line per rejected authentication to the server log, naming
+the stage: `no_credentials`, `token_decode_failed`, `user_row_not_found`, `user_inactive`,
+`authenticated_via_fallback`, and on the sign-in path `account_not_found`, `invalid_password`,
+`account_disabled`, `token_generation_failed`. Each line carries the request path, User-Agent,
+Origin, whether an `Authorization` header was present at all, and whether a session cookie was.
+
+No secret material is logged: a token appears only as its length and a 12-hex SHA-256 prefix, which
+cannot be reversed or replayed. Passwords and hashes are never logged. The user-facing message stays
+`Invalid credentials` for both an unknown email and a wrong password, so the log cannot be used to
+enumerate accounts through the API.
+
+Set `AUTH_DIAGNOSTICS=0` to silence it.
 
 ---
 
@@ -386,7 +447,7 @@ bundles during development.
 
 ```bash
 cd apps/api
-python3 -m pytest tests/          # 355 passed
+python3 -m pytest tests/          # 378 passed
 ```
 
 | File | Tests | Covers |
@@ -394,13 +455,13 @@ python3 -m pytest tests/          # 355 passed
 | `test_reconciliation.py` | 69 | Terminology mapping, date parsing and ambiguity, issue detection, document finalization |
 | `test_api_contracts.py` | 63 | Wire shapes the UI depends on; outreach/audit/caregiver guards and demo-OCR determinism |
 | `test_records.py` | 34 | Signed QR generation and verification, tamper/expiry rejection, offline sync contract |
-| `test_security.py` | 58 | RBAC matrix, fail-closed scoping, self-service field limits, registration escalation and provisioning |
+| `test_security.py` | 81 | RBAC matrix, fail-closed scoping, self-service field limits, registration escalation and provisioning, session cookie |
 | `test_offline_sync.py` | 33 | Idempotency, conflicts, batch limits |
 | `test_analytics.py` | 30 | Metric definitions, mutually exclusive buckets, suppression |
 | `test_inventory.py` | 25 | Stock arithmetic, expiry, low-stock and transaction guards |
 | `test_scheduling.py` | 25 | Rule evaluation, statuses, explanation wording |
 | `test_data_integrity.py` | 18 | Population-wide invariants across the seeded data |
-| **Total** | **355** | |
+| **Total** | **378** | |
 
 Notable things the tests assert, because they are easy to get wrong and easy to regress:
 
@@ -455,8 +516,17 @@ Stated plainly, because an honest gap list is more useful than a confident demo.
 - SQLite, not PostgreSQL, in this environment. The code is database-agnostic and migrations are real,
   but no PostgreSQL instance was available to test against.
 - No refresh tokens, no token revocation list, no MFA, no password reset, and no email verification
-  on registration. Sessions end only at JWT expiry.
-- Rate limiting is in-memory per process: it resets on restart and is not shared across workers.
+  on registration. `POST /auth/logout` clears the session cookie the browser will present, but a
+  stateless JWT cannot be revoked without a deny-list: a token already copied elsewhere stays valid
+  until it expires. The logout response says so rather than implying a full revocation.
+- Rate limiting is in-memory per process: it resets on restart and is not shared across workers. It
+  is keyed by client IP, and there is **no per-account throttling** — so many failures against one
+  account from many IPs are not specifically impeded, and one client behind a shared address can
+  exhaust the bucket for others. This is why `RATE_LIMIT_AUTH` is 60 rather than a tighter figure.
+- The session cookie is `SameSite=None; Secure`, which is required for the app to work inside a
+  cross-site iframe but also means it is sent on cross-site requests to this origin. A browser with
+  third-party cookies blocked will refuse to store it; the bearer-token path and the in-memory
+  fallback still work in that case, and the sign-in page says which mode it is in.
 - File uploads go to local disk with no object storage, no virus scanning and no CDN.
 - The signed record QR is an HMAC over the summary using a server-side secret. It confirms
   integrity and expiry but it is **not** a public-key credential: there is no certificate chain, no
@@ -471,7 +541,7 @@ Stated plainly, because an honest gap list is more useful than a confident demo.
   match reality.
 - **No automated frontend tests.** No Playwright, Cypress or Jest suite exists. The UI is verified by
   type-checking, a clean production build and manual route/API checks — which is materially weaker
-  than the backend's 355 tests.
+  than the backend's 378 tests.
 - No real-time updates (no WebSocket or SSE). Pages fetch on load and on explicit refresh.
 - Accessibility is implemented (semantic landmarks, focus states, `aria` attributes, reduced-motion
   support, keyboard-reachable controls) but has **not** been verified with assistive technology or an
@@ -495,7 +565,7 @@ Stated plainly, because an honest gap list is more useful than a confident demo.
 apps/
 ├── api/
 │   ├── app/
-│   │   ├── main.py            # 66 API operations, RBAC gates, audit, seeding
+│   │   ├── main.py            # 67 API operations, RBAC gates, audit, seeding
 │   │   ├── models.py          # 25 tables
 │   │   ├── schemas.py         # Pydantic v2 contracts + field validators
 │   │   ├── rbac.py            # capability sets, fail-closed patient scoping
@@ -509,7 +579,7 @@ apps/
 │   │   ├── inventory.py       # single source of stock arithmetic
 │   │   └── scheduling/engine.py
 │   ├── alembic/               # 2 migrations
-│   ├── tests/                 # 355 tests
+│   ├── tests/                 # 378 tests
 │   └── vaxbridge_demo.db
 └── web/
     ├── public/                # manifest, icon, service worker

@@ -23,6 +23,7 @@ import {
   Syringe,
 } from "lucide-react";
 import { getUser, removeToken } from "@/lib/auth";
+import { API } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
 type Role =
@@ -141,7 +142,12 @@ export function Sidebar({ isOpen, onClose }: SidebarProps) {
   const isActive = (href: string) =>
     href === "/app" ? pathname === "/app" : pathname === href || pathname.startsWith(href + "/");
 
-  const handleSignOut = () => {
+  const handleSignOut = async () => {
+    // The session also lives in an httpOnly cookie that JavaScript cannot delete,
+    // so the API is asked to clear it. Dropping only the local token would leave
+    // the cookie valid and the next /auth/me would sign the user straight back in.
+    onClose();
+    await API.logout();
     removeToken();
     router.push("/login");
   };

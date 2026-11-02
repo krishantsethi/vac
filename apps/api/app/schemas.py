@@ -6,8 +6,21 @@ from pydantic import BaseModel, EmailStr, Field, ConfigDict, field_validator
 
 
 class Token(BaseModel):
+    """Successful authentication.
+
+    ``user`` is returned so a client can complete sign-in from this one response
+    instead of issuing a second, authenticated round-trip to /auth/me. That
+    second call was the single point at which sign-in most often broke: it is the
+    first request that depends on the client having stored and re-read the token
+    correctly, and when script-accessible storage is blocked it goes out with no
+    credential at all — turning an accepted password into "Not authenticated".
+
+    Optional so that any caller still reading only ``access_token`` is unaffected.
+    """
+
     access_token: str
     token_type: str = "bearer"
+    user: Optional["UserOut"] = None
 
 
 class TokenPayload(BaseModel):

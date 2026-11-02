@@ -29,16 +29,20 @@ export type ToastVariant = "success" | "error" | "destructive" | "info" | "warni
  * `destructive` is accepted as an alias for `error` because that is the
  * convention used elsewhere in this codebase's components.
  */
-export function toast(message: string, opts?: { variant?: ToastVariant }) {
+export function toast(message: string, opts?: { variant?: ToastVariant; description?: string }) {
+  // `description` is forwarded so a call site can give a second line of context
+  // (the signed-in role, the reason a save was partial) without building its own
+  // markup or reaching for sonner directly and losing the shared theming.
+  const options = opts?.description ? { description: opts.description } : undefined;
   switch (opts?.variant) {
     case "success":
-      return sonnerToast.success(message);
+      return sonnerToast.success(message, options);
     case "error":
     case "destructive":
-      return sonnerToast.error(message);
+      return sonnerToast.error(message, options);
     case "warning":
-      return sonnerToast.warning(message);
+      return sonnerToast.warning(message, options);
     default:
-      return sonnerToast.info(message);
+      return sonnerToast.info(message, options);
   }
 }

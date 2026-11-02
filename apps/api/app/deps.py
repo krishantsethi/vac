@@ -10,7 +10,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
 
 from .database import SessionLocal, get_db
-from .auth import decode_token
+from .auth import decode_token, read_session_cookie, SESSION_COOKIE_NAME
 from .models import User
 
 security = HTTPBearer(auto_error=False)
@@ -62,32 +62,62 @@ async def get_current_user(
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(security)] = None,
     db: Session = Depends(get_db),
 ) -> User | None:
+    """Resolve the calling identity from a bearer token or the session cookie.
+
+    Credentials are tried in order of explicitness — a bearer header first, then
+    the httpOnly session cookie — and a credential that fails to decode does not
+    end the search. Two reasons:
+
+    * A client that cannot read its own storage may still present a stale token
+      it cached earlier while holding a perfectly valid cookie. Treating the
+      stale header as authoritative would sign that user out for a bug they
+      cannot see or fix.
+    * The cookie is a credential the server itself issued. Falling back to it
+      grants nothing the caller does not already legitimately hold.
+
+    Every attempt is logged with the branch that rejected it, so the fallback is
+    observable rather than silent. The response stays a single opaque 401: which
+    credential failed, and why, is useful to an attacker and not to a client.
+    """
     raw_header = request.headers.get("authorization")
-    token = None
-    if credentials is not None:
-        token = credentials.credentials
+    cookie_token = read_session_cookie(request)
 
-    if not token:
-        # Distinguish "no header at all" from "a header HTTPBearer would not
-        # accept" (wrong scheme, empty value). Both look identical to the client.
-        _diag("no_bearer_credentials", request,
-              extra=f"raw_auth_header={'yes' if raw_header else 'no'}")
-        return None
+    candidates: list[tuple[str, str]] = []
+    if credentials is not None and credentials.credentials:
+        candidates.append(("bearer", credentials.credentials))
+    if cookie_token:
+        candidates.append(("cookie", cookie_token))
 
-    user_id = decode_token(token)
-    if not user_id:
-        _diag("token_decode_failed", request, token,
-              extra="cause=bad_signature|expired|malformed")
+    if not candidates:
+        _diag("no_credentials", request,
+              extra=(f"raw_auth_header={'yes' if raw_header else 'no'} "
+                     f"session_cookie={'yes' if request.cookies.get(SESSION_COOKIE_NAME) else 'no'}"))
         return None
 
-    user = db.get(User, user_id)
-    if user is None:
-        _diag("user_row_not_found", request, token, extra=f"sub={user_id}")
-        return None
-    if not user.is_active:
-        _diag("user_inactive", request, token, extra=f"sub={user_id}")
-        return None
-    return user
+    for source, token in candidates:
+        user_id = decode_token(token)
+        if not user_id:
+            _diag("token_decode_failed", request, token,
+                  extra=f"source={source} cause=bad_signature|expired|malformed")
+            continue
+
+        user = db.get(User, user_id)
+        if user is None:
+            _diag("user_row_not_found", request, token, extra=f"source={source} sub={user_id}")
+            continue
+        if not user.is_active:
+            _diag("user_inactive", request, token, extra=f"source={source} sub={user_id}")
+            continue
+
+        request.state.credential_source = source
+        if source != "bearer" and len(candidates) > 1:
+            # Worth knowing during development: an explicit header was present but
+            # unusable, and the session was carried by the cookie instead.
+            _diag("authenticated_via_fallback", request, token,
+                  extra=f"source={source} rejected_first=bearer")
+        return user
+
+    return None
 
 
 def require_user(user: User | None = Depends(get_current_user)) -> User:

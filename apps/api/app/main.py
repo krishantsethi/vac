@@ -9,6 +9,7 @@ import hashlib
 import json
 import logging
 import os
+import sys
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -17,12 +18,21 @@ from typing import Any, List, Optional
 from fastapi import FastAPI, Depends, HTTPException, status, Request, UploadFile, File, Form, Query
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi import Response
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import case, func, or_
 
 from .database import engine, Base, SessionLocal, get_db
-from .auth import hash_password, verify_password, create_access_token, decode_token
+from .auth import (
+    hash_password,
+    verify_password,
+    create_access_token,
+    decode_token,
+    set_session_cookie,
+    clear_session_cookie,
+    SESSION_COOKIE_NAME,
+)
 from .deps import require_user, require_roles, require_capability, DbSession
 from . import models, schemas
 from . import rbac
@@ -80,10 +90,39 @@ app.add_middleware(
 # limits hold across replicas.
 RATE_LIMIT_WINDOW_SECONDS = 60
 RATE_LIMIT_DEFAULT = int(os.getenv("RATE_LIMIT_DEFAULT", "600"))
-RATE_LIMIT_AUTH = int(os.getenv("RATE_LIMIT_AUTH", "20"))
+#: 60 rather than 20. This service normally sits behind a reverse proxy that
+#: presents every request from one loopback address, so an IP-keyed bucket is
+#: shared by everyone reaching the app through it. At 20/minute a handful of
+#: sign-in retries by one person could lock out every other user of the
+#: instance. 60/minute still makes online password guessing impractical while
+#: not punishing legitimate use; the per-account protection that would let this
+#: be lower again is not implemented here and is listed as a known gap.
+RATE_LIMIT_AUTH = int(os.getenv("RATE_LIMIT_AUTH", "60"))
 _rate_buckets: dict[str, list[float]] = {}
 
 AUTH_PATHS = ("/api/v1/auth/login", "/api/v1/auth/register")
+
+
+#: Set when the deployment sits behind a proxy whose addresses should be trusted
+#: for client identification. Off by default: honouring X-Forwarded-For from an
+#: untrusted peer would let any caller rotate the header and evade the limit.
+TRUST_PROXY_HEADERS = os.getenv("TRUST_PROXY_HEADERS", "1") not in ("0", "false", "False")
+
+
+def _client_ip(request: Request) -> str:
+    """Best available identification of the calling client.
+
+    Behind a reverse proxy every connection comes from the proxy's loopback
+    address, which would collapse all users into a single rate-limit bucket.
+    The leftmost X-Forwarded-For entry is the original client. This is only
+    honoured when TRUST_PROXY_HEADERS is on, because otherwise a caller could
+    invent the header and get a fresh bucket on every request.
+    """
+    if TRUST_PROXY_HEADERS:
+        forwarded = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
+        if forwarded:
+            return forwarded
+    return request.client.host if request.client else "unknown"
 
 
 @app.middleware("http")
@@ -92,7 +131,7 @@ async def rate_limit_middleware(request: Request, call_next):
     if not path.startswith("/api/"):
         return await call_next(request)
 
-    client_ip = request.client.host if request.client else "unknown"
+    client_ip = _client_ip(request)
     bucket_key = f"{'auth' if path in AUTH_PATHS else 'default'}:{client_ip}"
     limit = RATE_LIMIT_AUTH if path in AUTH_PATHS else RATE_LIMIT_DEFAULT
 
@@ -146,6 +185,32 @@ def on_startup():
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
+
+#: Development diagnostics for the sign-in path. Set AUTH_DIAGNOSTICS=0 to silence.
+#:
+#: "Invalid credentials" is deliberately identical for an unknown email and a
+#: wrong password — telling a caller which one failed lets them enumerate
+#: accounts. That is right for the response and useless for debugging, so the
+#: distinction is written to the server log instead. Only the email and the
+#: failure stage are recorded: never a password, a hash, or a token.
+AUTH_DIAGNOSTICS = os.getenv("AUTH_DIAGNOSTICS", "1") not in ("0", "false", "False")
+
+
+def _diag_login(request: Request, stage: str, email: str = "", user_id: str = "") -> None:
+    """Record why a sign-in attempt did not produce a session."""
+    if not AUTH_DIAGNOSTICS:
+        return
+    parts = [f"[auth-diag] login_failed stage={stage}"]
+    if email:
+        parts.append(f"email={email}")
+    if user_id:
+        parts.append(f"user_id={user_id}")
+    if request is not None:
+        ua = request.headers.get("user-agent") or "-"
+        parts.append(f"ua={ua[:110]}")
+        parts.append(f"origin={request.headers.get('origin') or '-'}")
+    print(" ".join(parts), file=sys.stderr, flush=True)
+
 
 def _parse_audit_details(raw):
     """Decode a stored audit payload into a structured value.
@@ -311,7 +376,7 @@ def _ensure_seed_data():
 # --------------------------------------------------------------------------- #
 
 @app.post("/api/v1/auth/register", response_model=schemas.Token)
-def register(payload: schemas.UserRegister, db: DbSession, request: Request):
+def register(payload: schemas.UserRegister, response: Response, db: DbSession, request: Request):
     """Public self-registration.
 
     Only ``patient`` and ``caregiver`` may be claimed here — the two roles whose
@@ -355,20 +420,67 @@ def register(payload: schemas.UserRegister, db: DbSession, request: Request):
     db.commit()
     db.refresh(user)
     token = create_access_token(user.id)
+    set_session_cookie(response, token, request)
     _audit(db, user, "register", "users", user.id, {"email": user.email}, request)
-    return {"access_token": token, "token_type": "bearer"}
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "user": schemas.UserOut.model_validate(user).model_dump(mode="json"),
+    }
+
+
+@app.post("/api/v1/auth/logout")
+def logout(response: Response, db: DbSession, request: Request, user: models.User = Depends(require_user)):
+    """End the session.
+
+    Clears the httpOnly cookie. A stateless JWT cannot be revoked server-side
+    without a deny-list, so the token itself stays valid until it expires — the
+    honest position is to clear the credential the browser will present and to
+    say so, rather than to imply the token has been invalidated everywhere.
+    """
+    clear_session_cookie(response, request)
+    _audit(db, user, "logout", "users", user.id, {"email": user.email}, request)
+    return {"detail": "Signed out on this browser. The issued token expires on its own schedule."}
 
 
 @app.post("/api/v1/auth/login", response_model=schemas.Token)
-def login(payload: schemas.UserLogin, db: DbSession, request: Request):
+def login(payload: schemas.UserLogin, response: Response, db: DbSession, request: Request):
+    """Verify credentials and establish a session.
+
+    Returns the token *and* the authenticated user, and also sets an httpOnly
+    session cookie. Either credential is accepted on subsequent requests, so the
+    session does not depend on the client being able to store and replay the
+    token in JavaScript-accessible storage.
+
+    The same 401 is returned for an unknown email and a wrong password: which of
+    the two failed is useful to an attacker enumerating accounts and is therefore
+    recorded in the server log rather than in the response.
+    """
     user = db.query(models.User).filter(models.User.email == payload.email).first()
-    if not user or not verify_password(payload.password, user.password_hash):
+    if not user:
+        _diag_login(request, "account_not_found", email=payload.email)
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+    if not verify_password(payload.password, user.password_hash):
+        _diag_login(request, "invalid_password", email=payload.email, user_id=user.id)
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
     if not user.is_active:
+        _diag_login(request, "account_disabled", email=payload.email, user_id=user.id)
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account disabled")
+
     token = create_access_token(user.id)
+    if not token:
+        _diag_login(request, "token_generation_failed", email=payload.email, user_id=user.id)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Credentials were accepted but a session could not be created.",
+        )
+    set_session_cookie(response, token, request)
     _audit(db, user, "login", "users", user.id, {"email": user.email}, request)
-    return {"access_token": token, "token_type": "bearer"}
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "user": schemas.UserOut.model_validate(user).model_dump(mode="json"),
+    }
 
 
 @app.get("/api/v1/auth/me", response_model=schemas.UserOut)
@@ -2507,7 +2619,28 @@ def root():
     }
 
 
-def _health_payload() -> dict:
+def _request_context(request) -> dict:
+    """Describe how this request reached the service, for proxy diagnostics.
+
+    Cookie attributes depend on the scheme and site the *browser* used, which is
+    not the scheme of the proxy-to-API hop. Reporting what the forwarding headers
+    say makes a SameSite/Secure misconfiguration visible instead of letting it
+    present as an inexplicable sign-out.
+    """
+    if request is None:
+        return {"client_scheme": None, "forwarded_proto": None, "forwarded_host": None}
+    proto = (request.headers.get("x-forwarded-proto") or "").split(",")[0].strip() or None
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host") or None
+    return {
+        "client_scheme": proto or getattr(request.url, "scheme", None),
+        "forwarded_proto": proto,
+        "forwarded_host": host,
+        "forwarded_for": (request.headers.get("x-forwarded-for") or "").split(",")[0].strip() or None,
+        "peer": request.client.host if request.client else None,
+    }
+
+
+def _health_payload(request=None) -> dict:
     """Liveness plus a real database round-trip.
 
     Reported under /api/v1 as well as /health because the web front end proxies
@@ -2533,6 +2666,7 @@ def _health_payload() -> dict:
         "ocr_provider": "demo-ocr-fixture" if DEMO_MODE else "not configured",
         "server_time_utc": datetime.utcnow().isoformat() + "Z",
         "external_integrations": "none",
+        "request_context": _request_context(request),
         "disclaimer": (
             "Prototype demonstration. Not a government system and not connected to CoWIN, "
             "U-WIN, ABDM or any official immunisation registry."
@@ -2541,10 +2675,10 @@ def _health_payload() -> dict:
 
 
 @app.get("/health")
-def health():
-    return _health_payload()
+def health(request: Request):
+    return _health_payload(request)
 
 
 @app.get("/api/v1/health")
-def api_health():
-    return _health_payload()
+def api_health(request: Request):
+    return _health_payload(request)
