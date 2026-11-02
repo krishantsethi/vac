@@ -86,7 +86,7 @@ It is not a medical-risk prediction and must not be read as clinical judgement.
 | Charts | Recharts (2D, for real data — the 3D scene is decorative and never encodes data) |
 
 **Size:** ~9,400 lines of Python (application + tests), ~12,400 lines of TypeScript/TSX, 25 database
-tables, 2 Alembic migrations, 65 API operations (40 GET / 17 POST / 8 PATCH), 28 web routes.
+tables, 2 Alembic migrations, 66 API operations (40 GET / 18 POST / 8 PATCH), 29 web routes.
 
 The API is the authority. The front end never decides authorization — it mirrors the server's
 capability sets **for display only**, so the interface does not offer a destination the server will
@@ -220,6 +220,51 @@ Two properties are deliberate and tested:
 Patient self-service is restricted to `full_name`, `phone` and `language`. A user cannot set their
 own `is_active`, role, or any clinical field.
 
+### Account provisioning
+
+Public self-registration (`POST /api/v1/auth/register`) accepts only the **`patient`** and
+**`caregiver`** roles — the two whose reach is confined to the person's own record, or to dependents
+a clinic has explicitly authorized. Any other role is refused with 403, and an unrecognized role
+with 400.
+
+This is enforced on the server, not in the form. Before the guard existed, the endpoint accepted
+whatever `role` appeared in the request body: posting `{"role": "clinic_admin"}` returned a token
+with read/write access to all 37 seeded patients. Restricting the dropdown would not have fixed it,
+because the request is plain JSON. `test_security.py` now asserts that every privileged role is
+refused, that no account row is created by a refused attempt, and that a freshly registered
+`patient` or `caregiver` sees zero patients.
+
+Staff and administrative accounts are created by a holder of `USER_MANAGE` (`system_admin`,
+`clinic_admin`) through `POST /api/v1/users`, which validates the role, rejects duplicate emails,
+and writes an audit event naming the provisioner. A newly registered caregiver starts with no
+dependents; each link must be authorized individually before any record becomes visible.
+
+Accounts created in this build are **not email-verified** (`is_verified=False` for self-registration).
+Nothing depends on that flag yet, and the registration page says so rather than implying a
+confirmation email is on its way.
+
+### Session storage
+
+The session is a JWT held in `localStorage`, read by `src/lib/auth.ts`. Every access is wrapped and
+every write is verified by reading it back, with an in-memory fallback for the current tab.
+
+This is not defensive decoration. Browsers partition or block `localStorage` in cross-site frames —
+which is exactly how a preview host serves this app — and under those restrictions a write can
+succeed while the following read returns `null`. The visible symptom was total: `POST /auth/login`
+returned **200** with a valid token, the next request went out with no `Authorization` header, and
+the server answered **401 "Not authenticated"**. Users were told sign-in failed when their
+credentials had been accepted.
+
+Two changes remove the failure mode:
+
+- The sign-in and sign-up flows confirm the session with the token **they are already holding**
+  (`API.getWithToken`) instead of reading it back from storage.
+- `request()` in `src/lib/api.ts` never overwrites an explicitly supplied `Authorization` header.
+
+When storage is genuinely unavailable the app still works for the tab, and both pages say so in a
+banner instead of letting a later reload look like an unexplained sign-out. A session does not
+survive a reload in that state — stated plainly rather than papered over.
+
 ---
 
 ## Routes
@@ -341,7 +386,7 @@ bundles during development.
 
 ```bash
 cd apps/api
-python3 -m pytest tests/          # 331 passed
+python3 -m pytest tests/          # 355 passed
 ```
 
 | File | Tests | Covers |
@@ -349,13 +394,13 @@ python3 -m pytest tests/          # 331 passed
 | `test_reconciliation.py` | 69 | Terminology mapping, date parsing and ambiguity, issue detection, document finalization |
 | `test_api_contracts.py` | 63 | Wire shapes the UI depends on; outreach/audit/caregiver guards and demo-OCR determinism |
 | `test_records.py` | 34 | Signed QR generation and verification, tamper/expiry rejection, offline sync contract |
-| `test_security.py` | 34 | RBAC matrix, fail-closed scoping, self-service field limits |
+| `test_security.py` | 58 | RBAC matrix, fail-closed scoping, self-service field limits, registration escalation and provisioning |
 | `test_offline_sync.py` | 33 | Idempotency, conflicts, batch limits |
 | `test_analytics.py` | 30 | Metric definitions, mutually exclusive buckets, suppression |
 | `test_inventory.py` | 25 | Stock arithmetic, expiry, low-stock and transaction guards |
 | `test_scheduling.py` | 25 | Rule evaluation, statuses, explanation wording |
 | `test_data_integrity.py` | 18 | Population-wide invariants across the seeded data |
-| **Total** | **331** | |
+| **Total** | **355** | |
 
 Notable things the tests assert, because they are easy to get wrong and easy to regress:
 
@@ -426,7 +471,7 @@ Stated plainly, because an honest gap list is more useful than a confident demo.
   match reality.
 - **No automated frontend tests.** No Playwright, Cypress or Jest suite exists. The UI is verified by
   type-checking, a clean production build and manual route/API checks — which is materially weaker
-  than the backend's 331 tests.
+  than the backend's 355 tests.
 - No real-time updates (no WebSocket or SSE). Pages fetch on load and on explicit refresh.
 - Accessibility is implemented (semantic landmarks, focus states, `aria` attributes, reduced-motion
   support, keyboard-reachable controls) but has **not** been verified with assistive technology or an
@@ -450,7 +495,7 @@ Stated plainly, because an honest gap list is more useful than a confident demo.
 apps/
 ├── api/
 │   ├── app/
-│   │   ├── main.py            # 65 API operations, RBAC gates, audit, seeding
+│   │   ├── main.py            # 66 API operations, RBAC gates, audit, seeding
 │   │   ├── models.py          # 25 tables
 │   │   ├── schemas.py         # Pydantic v2 contracts + field validators
 │   │   ├── rbac.py            # capability sets, fail-closed patient scoping
@@ -464,7 +509,7 @@ apps/
 │   │   ├── inventory.py       # single source of stock arithmetic
 │   │   └── scheduling/engine.py
 │   ├── alembic/               # 2 migrations
-│   ├── tests/                 # 331 tests
+│   ├── tests/                 # 355 tests
 │   └── vaxbridge_demo.db
 └── web/
     ├── public/                # manifest, icon, service worker

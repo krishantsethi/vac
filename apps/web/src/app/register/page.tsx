@@ -1,76 +1,295 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
+import { AlertTriangle, Loader2, ShieldCheck, XCircle } from "lucide-react";
 import { API } from "@/lib/api";
-import { setToken, setUser } from "@/lib/auth";
+import { getToken, isSessionEphemeral, setToken, setUser } from "@/lib/auth";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { toast } from "@/components/ui/toast";
+import { formatIndianPhone, isValidIndianPhone, normalizeIndianPhone } from "@/lib/utils";
+
+/**
+ * Only the two roles whose reach is scoped to the person's own record or to
+ * dependents they are explicitly authorized for. The server enforces the same
+ * restriction — this list exists so the form does not offer a choice that will
+ * be refused, never as the control itself.
+ */
+const SELF_SERVICE_ROLES = [
+  {
+    value: "patient",
+    label: "Patient",
+    blurb: "Your own immunisation record, schedule and appointments.",
+  },
+  {
+    value: "caregiver",
+    label: "Parent / Caregiver",
+    blurb: "Children you care for, once a clinic authorizes each link.",
+  },
+];
 
 export default function RegisterPage() {
   const router = useRouter();
-  const [form, setForm] = useState({ email: "", password: "", full_name: "", role: "patient", phone: "", language: "en" });
+  const [form, setForm] = useState({
+    email: "",
+    password: "",
+    full_name: "",
+    role: "patient",
+    phone: "",
+    language: "en",
+  });
   const [loading, setLoading] = useState(false);
+  const [failure, setFailure] = useState<string | null>(null);
+  const [storageBlocked, setStorageBlocked] = useState(false);
+
+  useEffect(() => {
+    if (isSessionEphemeral()) setStorageBlocked(true);
+  }, []);
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
+    setFailure(null);
+
+    if (!form.full_name.trim()) {
+      setFailure("Please enter your full name.");
+      return;
+    }
+    if (!form.email.trim() || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(form.email.trim())) {
+      setFailure("Please enter a valid email address.");
+      return;
+    }
+    if (form.password.length < 8) {
+      setFailure("Your password must be at least 8 characters.");
+      return;
+    }
+    if (form.phone.trim() && !isValidIndianPhone(form.phone)) {
+      setFailure("Enter a valid Indian phone number — 10 digits, optionally prefixed with +91.");
+      return;
+    }
+
     setLoading(true);
     try {
-      const res = await API.post("/api/v1/auth/register", form);
-      setToken(res.access_token);
-      const me: any = await API.get("/api/v1/auth/me");
+      const res = await API.post("/api/v1/auth/register", {
+        ...form,
+        email: form.email.trim().toLowerCase(),
+        full_name: form.full_name.trim(),
+        phone: form.phone.trim() ? normalizeIndianPhone(form.phone) : null,
+      });
+
+      if (!res?.access_token) {
+        throw new Error("The API did not return an access token.");
+      }
+      const accessToken: string = res.access_token;
+      setToken(accessToken);
+
+      // Verified with the token in hand rather than read back from storage: when
+      // a browser partitions or blocks localStorage the read can return null, and
+      // the request would go out unauthenticated even though the account was just
+      // created successfully.
+      const me: any = await API.getWithToken("/api/v1/auth/me", accessToken);
+      if (!me?.id) {
+        throw new Error("Your account was created, but the session could not be confirmed.");
+      }
       setUser(me);
+
+      if (getToken() !== accessToken) {
+        setStorageBlocked(true);
+        toast("Account created. This browser is blocking stored sessions, so you will need to sign in again after a reload.", {
+          variant: "warning",
+        });
+      } else {
+        toast(`Account created — welcome, ${me.full_name || me.email}`, { variant: "success" });
+      }
       router.push("/app");
-    } catch (e: any) {
-      toast(e.message || "Registration failed", { variant: "error" });
+      router.refresh();
+    } catch (err: any) {
+      const message = err?.message || "Registration failed";
+      setFailure(message);
+      toast(message, { variant: "error" });
     } finally {
       setLoading(false);
     }
   };
 
-  return (
-    <div className="flex min-h-[calc(100vh-4rem)] items-center justify-center bg-navy px-6">
-      <div className="w-full max-w-md">
-        <div className="flex items-center gap-2 mb-6">
-          <span className="w-2 h-2 rounded-full bg-cyan shadow-[0_0_12px_rgba(56,217,255,0.6)]" />
-          <span className="font-display font-bold text-xl tracking-tight text-text">VAXBRIDGE<span className="text-cyan">AI</span></span>
-        </div>
-        <h2 className="font-display text-xl font-bold text-text mb-2">Create an account</h2>
-        <p className="text-text-secondary/90 text-sm mb-6">Prototype registration — roles are illustrative for the demonstration.</p>
+  const selectedRole = SELF_SERVICE_ROLES.find((r) => r.value === form.role);
 
-        <form onSubmit={submit} className="space-y-4">
-          <div className="flex flex-col gap-1">
-            <label className="text-xs font-medium text-text-secondary">Full name</label>
-            <Input value={form.full_name} onChange={(e) => setForm({ ...form, full_name: e.target.value })} />
+  return (
+    <div className="flex min-h-screen items-center justify-center bg-navy px-4 py-10">
+      <div className="w-full max-w-md space-y-6">
+        <div className="flex items-center gap-2">
+          <span className="h-2 w-2 rounded-full bg-cyan shadow-[0_0_12px_rgba(56,217,255,0.6)]" aria-hidden />
+          <Link href="/" className="font-display text-xl font-bold tracking-tight text-text">
+            VAXBRIDGE<span className="text-cyan">AI</span>
+          </Link>
+        </div>
+
+        <div>
+          <h1 className="font-display text-2xl font-bold text-text">Create an account</h1>
+          <p className="mt-1 text-sm text-text-secondary">
+            Self-registration is limited to patient and caregiver accounts, because those are the
+            only roles whose access is confined to your own record or your own dependents.
+          </p>
+        </div>
+
+        {storageBlocked && (
+          <div className="flex items-start gap-3 rounded-lg border border-amber-500/30 bg-amber-500/8 p-4 text-sm">
+            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" aria-hidden />
+            <div className="space-y-1">
+              <p className="font-medium text-text">This browser is blocking stored sessions</p>
+              <p className="text-xs leading-relaxed text-text-secondary">
+                Registration still works and the session is kept in memory for this tab, but it will
+                not survive a reload. This usually happens when the app is embedded in a frame or
+                site data is blocked.
+              </p>
+            </div>
           </div>
-          <div className="flex flex-col gap-1">
-            <label className="text-xs font-medium text-text-secondary">Email</label>
-            <Input type="email" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} />
+        )}
+
+        <form onSubmit={submit} className="space-y-4 rounded-lg border border-border bg-surface p-5" noValidate>
+          <div className="space-y-1">
+            <label htmlFor="reg-name" className="text-xs font-medium uppercase tracking-wider text-text-secondary">
+              Full name
+            </label>
+            <Input
+              id="reg-name"
+              autoComplete="name"
+              value={form.full_name}
+              onChange={(e) => setForm({ ...form, full_name: e.target.value })}
+              required
+            />
           </div>
-          <div className="flex flex-col gap-1">
-            <label className="text-xs font-medium text-text-secondary">Password (min 8 chars)</label>
-            <Input type="password" value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} />
+
+          <div className="space-y-1">
+            <label htmlFor="reg-email" className="text-xs font-medium uppercase tracking-wider text-text-secondary">
+              Email
+            </label>
+            <Input
+              id="reg-email"
+              type="email"
+              autoComplete="username"
+              value={form.email}
+              onChange={(e) => setForm({ ...form, email: e.target.value })}
+              required
+            />
           </div>
-          <div className="flex flex-col gap-1">
-            <label className="text-xs font-medium text-text-secondary">Role</label>
-            <select value={form.role} onChange={(e) => setForm({ ...form, role: e.target.value })} className="block w-full rounded-md border border-border bg-navy-secondary text-text text-sm focus:border-cyan">
-              <option value="patient">Patient</option>
-              <option value="caregiver">Caregiver</option>
-              <option value="healthcare_worker">Healthcare Worker</option>
+
+          <div className="space-y-1">
+            <label htmlFor="reg-password" className="text-xs font-medium uppercase tracking-wider text-text-secondary">
+              Password
+            </label>
+            <Input
+              id="reg-password"
+              type="password"
+              autoComplete="new-password"
+              value={form.password}
+              onChange={(e) => setForm({ ...form, password: e.target.value })}
+              minLength={8}
+              required
+            />
+            <p className="text-[11px] text-text-secondary/70">At least 8 characters.</p>
+          </div>
+
+          <div className="space-y-1">
+            <label htmlFor="reg-phone" className="text-xs font-medium uppercase tracking-wider text-text-secondary">
+              Phone (optional)
+            </label>
+            <Input
+              id="reg-phone"
+              type="tel"
+              autoComplete="tel"
+              inputMode="tel"
+              placeholder="+91 98XXXXXXXX"
+              value={form.phone}
+              onChange={(e) => setForm({ ...form, phone: e.target.value })}
+            />
+            <p className="text-[11px] text-text-secondary/70">
+              Indian mobile numbers{form.phone && isValidIndianPhone(form.phone)
+                ? ` — will be stored as ${formatIndianPhone(normalizeIndianPhone(form.phone))}`
+                : " — 10 digits, optionally prefixed with +91."}
+            </p>
+          </div>
+
+          <div className="space-y-1">
+            <label htmlFor="reg-role" className="text-xs font-medium uppercase tracking-wider text-text-secondary">
+              I am registering as
+            </label>
+            <select
+              id="reg-role"
+              value={form.role}
+              onChange={(e) => setForm({ ...form, role: e.target.value })}
+              className="block h-10 w-full rounded-md border border-border bg-navy-secondary px-3 text-sm text-text outline-none focus:border-cyan"
+            >
+              {SELF_SERVICE_ROLES.map((r) => (
+                <option key={r.value} value={r.value}>
+                  {r.label}
+                </option>
+              ))}
+            </select>
+            {selectedRole && (
+              <p className="text-[11px] text-text-secondary/80">{selectedRole.blurb}</p>
+            )}
+          </div>
+
+          <div className="space-y-1">
+            <label htmlFor="reg-language" className="text-xs font-medium uppercase tracking-wider text-text-secondary">
+              Language preference
+            </label>
+            <select
+              id="reg-language"
+              value={form.language}
+              onChange={(e) => setForm({ ...form, language: e.target.value })}
+              className="block h-10 w-full rounded-md border border-border bg-navy-secondary px-3 text-sm text-text outline-none focus:border-cyan"
+            >
+              <option value="en">English</option>
+              <option value="hi">Hindi (preference stored — interface not yet translated)</option>
             </select>
           </div>
+
+          {failure && (
+            <div
+              className="flex items-start gap-3 rounded-md border border-red-500/30 bg-red-500/10 p-3 text-sm"
+              role="alert"
+            >
+              <XCircle className="mt-0.5 h-4 w-4 shrink-0 text-red-400" aria-hidden />
+              <p className="break-words text-text-secondary">{failure}</p>
+            </div>
+          )}
+
           <Button variant="primary" type="submit" disabled={loading} className="w-full">
+            {loading ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
             {loading ? "Creating account…" : "Create account"}
           </Button>
+
+          <p className="text-center text-xs text-text-secondary/70">
+            Already have an account?{" "}
+            <Link href="/login" className="text-cyan hover:underline">
+              Sign in
+            </Link>
+          </p>
         </form>
 
-        <p className="mt-6 text-[11px] text-text-secondary/60 text-center">
-          Already have an account? <Link href="/login" className="text-cyan hover:underline">Sign in</Link>
-        </p>
-        <p className="mt-2 text-[11px] text-text-secondary/60 text-center">
-          Prototype demonstration. Not a government system.
+        <div className="flex items-start gap-3 rounded-lg border border-border bg-navy-secondary/40 p-4 text-xs leading-relaxed text-text-secondary">
+          <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-cyan" aria-hidden />
+          <div className="space-y-1.5">
+            <p className="font-medium text-text">Healthcare worker or administrator?</p>
+            <p>
+              Staff and administrative accounts are created by a clinic or system administrator from
+              the admin workspace. They cannot be self-registered, because those roles reach records
+              belonging to other people. The API refuses the request even if the form is bypassed.
+            </p>
+            <p>
+              A new caregiver account starts with no dependents. Each link must be authorized
+              individually by a clinic before any record becomes visible.
+            </p>
+          </div>
+        </div>
+
+        <p className="text-center text-[11px] leading-relaxed text-text-secondary/60">
+          Prototype demonstration with synthetic data. Not a government system, and not connected to
+          or endorsed by CoWIN, U-WIN, ABDM or any official immunisation registry. Accounts are not
+          verified by email in this build, so do not reuse a password you use elsewhere.
         </p>
       </div>
     </div>

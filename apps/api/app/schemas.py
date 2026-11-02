@@ -16,6 +16,22 @@ class TokenPayload(BaseModel):
 
 # ---- Auth ----
 
+class UserCreate(BaseModel):
+    """Administrator-provisioned account.
+
+    Unlike self-registration this may create any role, because the caller has
+    already been authorized by USER_MANAGE. A temporary password is required and
+    should be changed by the new holder on first sign-in.
+    """
+
+    email: EmailStr
+    password: str = Field(min_length=8)
+    full_name: str = Field(min_length=1, max_length=255)
+    role: str = Field(default="healthcare_worker")
+    phone: Optional[str] = None
+    language: str = Field(default="en")
+
+
 class UserRegister(BaseModel):
     email: EmailStr
     password: str = Field(min_length=8)

@@ -5,7 +5,7 @@ import { API } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { toast } from "@/components/ui/toast";
-import { getUser } from "@/lib/auth";
+import { getUser, setUser } from "@/lib/auth";
 
 export function SettingsPage() {
   const user = getUser();
@@ -21,10 +21,10 @@ export function SettingsPage() {
     setLoading(true);
     try {
       await API.patch(`/api/v1/users/${user?.id}`, form);
-      if (typeof window !== "undefined") {
-        const u = { ...getUser(), ...form };
-        localStorage.setItem("vaxbridge_user", JSON.stringify(u));
-      }
+      // setUser is storage-safe: if the browser blocks localStorage it falls back
+      // to memory instead of throwing, so a successful save is never reported as
+      // a failure just because the profile could not be persisted.
+      setUser({ ...getUser(), ...form });
       toast("Settings saved", { variant: "success" });
     } catch (e: any) { toast(e.message || "Save failed", { variant: "error" }); }
     finally { setLoading(false); }

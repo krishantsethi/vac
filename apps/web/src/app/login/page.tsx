@@ -1,11 +1,11 @@
 "use client";
 
-import { Suspense, useCallback, useEffect, useState } from "react";
+import { Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
 import { AlertTriangle, CheckCircle2, Loader2, ShieldAlert, XCircle } from "lucide-react";
 import { API } from "@/lib/api";
-import { getToken, removeToken, setToken, setUser } from "@/lib/auth";
+import { getToken, isSessionEphemeral, removeToken, setToken, setUser } from "@/lib/auth";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { toast } from "@/components/ui/toast";
@@ -42,6 +42,8 @@ function LoginForm() {
   const [submitting, setSubmitting] = useState(false);
   const [apiState, setApiState] = useState<ApiState>({ kind: "checking" });
   const [failure, setFailure] = useState<{ title: string; detail: string } | null>(null);
+  const [sessionWarning, setSessionWarning] = useState(false);
+  const [storageBlocked, setStorageBlocked] = useState(false);
 
   const checkApi = useCallback(async () => {
     setApiState({ kind: "checking" });
@@ -70,12 +72,22 @@ function LoginForm() {
 
   useEffect(() => {
     checkApi();
+    // Detect a browser that will not carry a stored session (third-party frame
+    // restrictions, blocked site data, private mode) and say so up front.
+    if (isSessionEphemeral()) setStorageBlocked(true);
   }, [checkApi]);
 
   // A token left over from an earlier database can look valid locally while the
-  // server no longer recognises the account it names. Drop it before signing in
-  // so a stale session cannot bounce the user straight back here.
+  // server no longer recognises the account it names. Drop it once, before the
+  // first sign-in attempt.
+  //
+  // Guarded by a ref: this component sits under a Suspense boundary and can be
+  // re-mounted, and an unguarded effect would delete the token that the in-flight
+  // submit has just stored — turning a successful login into "Not authenticated".
+  const clearedRef = useRef(false);
   useEffect(() => {
+    if (clearedRef.current) return;
+    clearedRef.current = true;
     if (getToken()) removeToken();
   }, []);
 
@@ -97,17 +109,34 @@ function LoginForm() {
       if (!res?.access_token) {
         throw new Error("The API did not return an access token.");
       }
-      setToken(res.access_token);
+      const accessToken: string = res.access_token;
+      setToken(accessToken);
 
-      // Confirm the session actually works before navigating, so the user is not
-      // sent to a shell that immediately bounces them back here.
-      const me = await API.get("/api/v1/auth/me");
+      // Confirm the session works before navigating, so the user is not sent to a
+      // shell that immediately bounces them back here.
+      //
+      // The token is passed explicitly rather than read back from storage: when
+      // the browser partitions or blocks localStorage (common inside an iframe)
+      // the read can return null, and the request would go out unauthenticated
+      // even though the credentials were just accepted.
+      const me = await API.getWithToken("/api/v1/auth/me", accessToken);
       if (!me?.id) {
         removeToken();
         throw new Error("Signed in, but the session could not be confirmed.");
       }
       setUser(me);
-      toast(`Signed in as ${me.full_name || me.email} (${me.role})`, { variant: "success" });
+
+      if (getToken() !== accessToken) {
+        // Storage is not carrying the session. The tab still works from the
+        // in-memory fallback, but say so instead of letting a reload look like
+        // an unexplained sign-out.
+        setSessionWarning(true);
+        toast("Signed in for this tab. This browser is blocking stored sessions, so you will need to sign in again after a reload.", {
+          variant: "warning",
+        });
+      } else {
+        toast(`Signed in as ${me.full_name || me.email} (${me.role})`, { variant: "success" });
+      }
       router.push(from);
       router.refresh();
     } catch (err: any) {
@@ -194,6 +223,24 @@ function LoginForm() {
             <Button variant="ghost" size="sm" onClick={checkApi}>
               Retry connection
             </Button>
+          </div>
+        )}
+
+        {(storageBlocked || sessionWarning) && (
+          <div className="flex items-start gap-3 rounded-lg border border-amber-500/30 bg-amber-500/8 p-4 text-sm">
+            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" aria-hidden />
+            <div className="space-y-1">
+              <p className="font-medium text-text">
+                This browser is blocking stored sessions
+              </p>
+              <p className="text-xs leading-relaxed text-text-secondary">
+                Sign-in still works, and the session is kept in memory for this
+                tab. It will not survive a page reload, because the browser is
+                refusing to store it — this usually happens when the app is
+                embedded in a frame or site data is blocked. Nothing is wrong
+                with your credentials.
+              </p>
+            </div>
           </div>
         )}
 

@@ -92,6 +92,30 @@ SCHEDULE_VIEW = frozenset({"system_admin", "healthcare_worker", "clinic_admin", 
 #: Technical administration: platform configuration, roles, reference data.
 SYSTEM_ADMINISTRATION = frozenset({"system_admin", "clinic_admin"})
 
+#: Every role the system recognises. Used to reject unknown values rather than
+#: storing an arbitrary string that silently matches no capability set.
+ALL_ROLES = frozenset({
+    "patient",
+    "caregiver",
+    "healthcare_worker",
+    "clinic_admin",
+    "public_health_admin",
+    "system_admin",
+})
+
+#: Roles a visitor may claim for themselves during public self-registration.
+#:
+#: Deliberately only the two roles whose access is scoped to the person's own
+#: record or to dependents they are explicitly authorized for. Every other role
+#: carries population-wide clinical or administrative reach, so granting one is
+#: a provisioning decision that belongs to an administrator (USER_MANAGE), not
+#: to the person requesting it.
+#:
+#: This is a server-side control. It cannot be satisfied by hiding an option in
+#: the registration form: an attacker posts JSON directly, and before this guard
+#: existed that granted full clinical access to all patients.
+SELF_REGISTRATION_ROLES = frozenset({"patient", "caregiver"})
+
 #: Roles that see the whole clinic population rather than a scoped subset.
 POPULATION_ROLES = CLINICAL_READ
 
@@ -131,6 +155,8 @@ def can_view_all_outreach(role: Optional[str]) -> bool:
 
 
 __all__ = [
+    "ALL_ROLES",
+    "SELF_REGISTRATION_ROLES",
     "CLINICAL_READ",
     "CLINICAL_WRITE",
     "PATIENT_MANAGEMENT",

@@ -341,3 +341,135 @@ def test_tampered_qr_payload_is_rejected(client, tokens, first_patient_id):
     assert public.status_code in (200, 400)
     if public.status_code == 200:
         assert public.json().get("valid") is False
+
+
+# --------------------------------------------------------------------------- #
+# Registration privilege escalation
+#
+# Before these guards, POST /auth/register accepted any `role` in the body. An
+# unauthenticated caller could create a clinic_admin or healthcare_worker account
+# and immediately read or write every patient in the database — a complete bypass
+# of the RBAC model. Restricting the options in the form would not have helped:
+# the request is plain JSON.
+# --------------------------------------------------------------------------- #
+
+PRIVILEGED_ROLES = ["healthcare_worker", "clinic_admin", "public_health_admin", "system_admin"]
+
+
+def _register(client, email, role):
+    return client.post("/api/v1/auth/register", json={
+        "email": email, "password": "Escalation@123",
+        "full_name": "Escalation Probe", "role": role,
+    })
+
+
+@pytest.mark.parametrize("role", PRIVILEGED_ROLES)
+def test_self_registration_cannot_claim_a_privileged_role(client, role):
+    r = _register(client, f"esc_{role}@vaxbridge.demo", role)
+    assert r.status_code == 403, r.text
+    assert "access_token" not in r.json()
+
+
+@pytest.mark.parametrize("role", PRIVILEGED_ROLES)
+def test_escalation_attempt_creates_no_account(client, db, role):
+    email = f"esc_none_{role}@vaxbridge.demo"
+    assert _register(client, email, role).status_code == 403
+    from app import models
+    assert db.query(models.User).filter(models.User.email == email).first() is None
+
+
+@pytest.mark.parametrize("role", ["patient", "caregiver"])
+def test_self_registration_still_works_for_scoped_roles(client, role):
+    r = _register(client, f"legit_{role}@vaxbridge.demo", role)
+    assert r.status_code == 200, r.text
+    token = r.json()["access_token"]
+    me = client.get("/api/v1/auth/me", headers=auth(token)).json()
+    assert me["role"] == role
+
+
+@pytest.mark.parametrize("role", ["patient", "caregiver"])
+def test_newly_registered_scoped_accounts_see_no_patients(client, role):
+    """A fresh self-registered account must not inherit population visibility."""
+    token = _register(client, f"scoped_{role}@vaxbridge.demo", role).json()["access_token"]
+    listing = client.get("/api/v1/patients?page_size=100", headers=auth(token))
+    assert listing.status_code == 200
+    assert listing.json()["total"] == 0
+
+
+def test_self_registration_rejects_an_unknown_role(client):
+    r = _register(client, "unknown_role@vaxbridge.demo", "superuser")
+    assert r.status_code == 400
+    assert "superuser" in r.json()["detail"]
+
+
+def test_self_registration_rejects_an_empty_role(client):
+    r = client.post("/api/v1/auth/register", json={
+        "email": "empty_role@vaxbridge.demo", "password": "Escalation@123",
+        "full_name": "Empty Role", "role": "   ",
+    })
+    assert r.status_code == 400
+
+
+# --------------------------------------------------------------------------- #
+# Administrator provisioning — the legitimate path to a staff account
+# --------------------------------------------------------------------------- #
+
+def _provision(client, token, email, role, password="Provision@123"):
+    return client.post("/api/v1/users", headers=auth(token), json={
+        "email": email, "password": password,
+        "full_name": "Provisioned Staff", "role": role,
+    })
+
+
+def test_clinic_admin_can_provision_a_healthcare_worker(client, tokens, db):
+    r = _provision(client, tokens["clinic_admin"], "prov_worker@vaxbridge.demo", "healthcare_worker")
+    assert r.status_code == 201, r.text
+    assert r.json()["role"] == "healthcare_worker"
+    # The provisioned account can sign in and does have clinical reach.
+    login = client.post("/api/v1/auth/login", json={
+        "email": "prov_worker@vaxbridge.demo", "password": "Provision@123",
+    })
+    assert login.status_code == 200
+    listing = client.get("/api/v1/patients?page_size=100", headers=auth(login.json()["access_token"]))
+    assert listing.json()["total"] > 0
+
+
+def test_system_admin_can_provision_administrative_roles(client, tokens):
+    assert _provision(client, tokens["system_admin"], "prov_ca@vaxbridge.demo", "clinic_admin").status_code == 201
+    assert _provision(client, tokens["system_admin"], "prov_ph@vaxbridge.demo", "public_health_admin").status_code == 201
+
+
+# system_admin and clinic_admin hold USER_MANAGE, so they are the two roles
+# that must be able to provision; every other role must be refused.
+@pytest.mark.parametrize("role", ["patient", "caregiver", "healthcare_worker", "public_health_admin"])
+def test_provisioning_is_refused_without_user_manage(client, tokens, role):
+    """Only system_admin and clinic_admin may create accounts."""
+    r = _provision(client, tokens[role], f"prov_denied_{role}@vaxbridge.demo", "healthcare_worker")
+    assert r.status_code == 403, f"{role} was able to provision an account"
+
+
+def test_provisioning_rejects_an_unknown_role(client, tokens):
+    r = _provision(client, tokens["clinic_admin"], "prov_bad_role@vaxbridge.demo", "emperor")
+    assert r.status_code == 400
+    assert "emperor" in r.json()["detail"]
+
+
+def test_provisioning_rejects_a_duplicate_email(client, tokens):
+    assert _provision(client, tokens["clinic_admin"], "clinic@vaxbridge.demo", "healthcare_worker").status_code == 409
+
+
+def test_provisioning_records_an_audit_event(client, tokens, db):
+    _provision(client, tokens["clinic_admin"], "prov_audit@vaxbridge.demo", "healthcare_worker")
+    audit = client.get("/api/v1/audit?action=create&entity_type=users", headers=auth(tokens["clinic_admin"]))
+    assert audit.status_code == 200
+    emails = [i.get("details", {}).get("email") for i in audit.json()["items"]]
+    assert "prov_audit@vaxbridge.demo" in emails
+
+
+def test_provisioned_account_password_is_not_stored_in_plaintext(client, tokens, db):
+    _provision(client, tokens["clinic_admin"], "prov_hash@vaxbridge.demo", "healthcare_worker")
+    from app import models
+    user = db.query(models.User).filter(models.User.email == "prov_hash@vaxbridge.demo").first()
+    assert user is not None
+    assert user.password_hash != "Provision@123"
+    assert "Provision@123" not in (user.password_hash or "")

@@ -3,13 +3,25 @@ import { getToken, removeToken } from "./auth";
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "";
 
 async function request(input: RequestInfo, init: RequestInit = {}): Promise<Response> {
-  const token = getToken();
   const headers: Record<string, string> = { ...(init.headers as Record<string, string> | undefined) || {} };
-  if (token) headers.Authorization = `Bearer ${token}`;
+
+  // An explicitly supplied Authorization header always wins. The sign-in flow
+  // uses this to confirm a freshly issued token without depending on a storage
+  // round-trip, which can fail when the browser partitions or blocks
+  // localStorage (common when the app is served inside an iframe).
+  const hasExplicitAuth = Object.keys(headers).some(
+    (key) => key.toLowerCase() === "authorization"
+  );
+  if (!hasExplicitAuth) {
+    const token = getToken();
+    if (token) headers.Authorization = `Bearer ${token}`;
+  }
 
   const res = await fetch(input, { ...init, headers });
   if (res.status === 401) {
-    removeToken();
+    // Only clear the stored session when we are not mid-sign-in: a 401 on the
+    // verification call is handled by the caller, which still holds the token.
+    if (!hasExplicitAuth) removeToken();
     if (typeof window !== "undefined" && window.location.pathname.startsWith("/app")) {
       window.location.href = "/login?session=expired";
     }
@@ -35,6 +47,15 @@ export async function api<T>(input: RequestInfo, init: RequestInit = {}): Promis
 
 export const API = {
   get: (path: string) => api<any>(`${API_BASE}${path}`),
+  /**
+   * GET with an explicitly supplied bearer token.
+   *
+   * Used by the sign-in flow to verify a token it has just received, before
+   * relying on storage to carry it. This removes a whole class of failure where
+   * the credentials are accepted but the session cannot be read back.
+   */
+  getWithToken: (path: string, token: string) =>
+    api<any>(`${API_BASE}${path}`, { headers: { Authorization: `Bearer ${token}` } }),
   post: (path: string, body?: any) =>
     api<any>(`${API_BASE}${path}`, {
       method: "POST",

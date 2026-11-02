@@ -130,6 +130,23 @@ def on_startup():
 # Helpers
 # --------------------------------------------------------------------------- #
 
+def _parse_audit_details(raw):
+    """Decode a stored audit payload into a structured value.
+
+    Returns the parsed JSON when the column holds valid JSON, the original string
+    when it does not (older rows or free-text notes), and None when empty. Never
+    raises: an unparseable audit entry must not make the whole log unreadable.
+    """
+    if raw is None or raw == "":
+        return None
+    if isinstance(raw, (dict, list)):
+        return raw
+    try:
+        return json.loads(raw)
+    except (ValueError, TypeError):
+        return raw
+
+
 def _audit(db: Session, user: Optional[models.User], action: str, entity_type: str, entity_id: Optional[str], details: Any, request: Optional[Request] = None):
     ip = None
     if request is not None and request.client is not None:
@@ -278,13 +295,40 @@ def _ensure_seed_data():
 
 @app.post("/api/v1/auth/register", response_model=schemas.Token)
 def register(payload: schemas.UserRegister, db: DbSession, request: Request):
+    """Public self-registration.
+
+    Only ``patient`` and ``caregiver`` may be claimed here — the two roles whose
+    reach is limited to the person's own record or to dependents explicitly
+    authorized for them. Every other role carries population-wide clinical or
+    administrative access and must be provisioned by an administrator through
+    POST /api/v1/users.
+
+    This guard is the server-side control; restricting the options in the
+    registration form would not be one. Before it existed, posting
+    ``{"role": "clinic_admin"}`` to this endpoint returned a token with
+    read/write access to every patient in the database.
+    """
+    requested_role = (payload.role or "patient").strip()
+    if requested_role not in rbac.ALL_ROLES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unknown role '{requested_role}'. Known roles: {', '.join(sorted(rbac.ALL_ROLES))}",
+        )
+    if requested_role not in rbac.SELF_REGISTRATION_ROLES:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                f"The '{requested_role}' role cannot be self-registered because it grants access "
+                "beyond your own record. Ask a clinic or system administrator to create the account."
+            ),
+        )
     if db.query(models.User).filter(models.User.email == payload.email).first():
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email already registered")
     user = models.User(
         email=payload.email,
         password_hash=hash_password(payload.password),
         full_name=payload.full_name,
-        role=payload.role,
+        role=requested_role,
         phone=payload.phone,
         language=payload.language,
         is_active=True,
@@ -318,6 +362,41 @@ def me(user: models.User = Depends(require_user)):
 # --------------------------------------------------------------------------- #
 # Users
 # --------------------------------------------------------------------------- #
+
+@app.post("/api/v1/users", response_model=schemas.UserOut, status_code=status.HTTP_201_CREATED)
+def create_user(payload: schemas.UserCreate, db: DbSession, user: models.User = Depends(require_capability(rbac.USER_MANAGE, "provision user accounts")), request: Request = None):
+    """Create an account, including staff and administrative roles.
+
+    This is the only path to a clinical or administrative account. Public
+    self-registration is limited to patient and caregiver, so the ability to
+    grant population-wide access stays with roles that already hold USER_MANAGE.
+    """
+    role = (payload.role or "").strip()
+    if role not in rbac.ALL_ROLES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unknown role '{role}'. Known roles: {', '.join(sorted(rbac.ALL_ROLES))}",
+        )
+    if db.query(models.User).filter(models.User.email == payload.email).first():
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email already registered")
+
+    created = models.User(
+        email=payload.email,
+        password_hash=hash_password(payload.password),
+        full_name=payload.full_name,
+        role=role,
+        phone=payload.phone,
+        language=payload.language,
+        is_active=True,
+        is_verified=True,
+    )
+    db.add(created)
+    db.commit()
+    db.refresh(created)
+    _audit(db, user, "create", "users", created.id,
+           {"email": created.email, "role": role, "provisioned_by": user.email}, request)
+    return created
+
 
 @app.get("/api/v1/users/caregivers", response_model=List[dict])
 def list_caregiver_accounts(db: DbSession, user: models.User = Depends(require_capability(rbac.CAREGIVER_MANAGE, "list caregiver accounts"))):
@@ -2002,6 +2081,11 @@ def list_audit(
     items_out = []
     for event in items:
         row = schemas.AuditEventOut.model_validate(event).model_dump(mode="json")
+        # `details` is persisted as JSON text. Hand it back as a structured object
+        # rather than an escaped string: an audit trail is meant to be read and
+        # filtered by people and tools, and a string payload forces every consumer
+        # to re-parse it (and to guess that it is JSON at all).
+        row["details"] = _parse_audit_details(event.details)
         row["actor_name"] = event.user.full_name if event.user else None
         row["actor_email"] = event.user.email if event.user else None
         row["actor_role"] = event.user.role if event.user else None
