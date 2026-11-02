@@ -6,6 +6,16 @@ import Link from "next/link";
 import { AlertTriangle, CheckCircle2, Loader2, ShieldAlert, XCircle } from "lucide-react";
 import { API } from "@/lib/api";
 import { getToken, isSessionEphemeral, removeToken, setToken, setUser } from "@/lib/auth";
+
+/**
+ * Build stamp, rendered on the page and logged to the console.
+ *
+ * This exists to settle one specific argument: when sign-in fails, is the browser
+ * running the code that is on disk, or a cached bundle from before a fix? The
+ * served file can be verified from the server side, but only the screen can prove
+ * what the browser actually executed. Bump this whenever the auth path changes.
+ */
+const AUTH_BUILD = "auth-fix-2";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { toast } from "@/components/ui/toast";
@@ -75,6 +85,10 @@ function LoginForm() {
     // Detect a browser that will not carry a stored session (third-party frame
     // restrictions, blocked site data, private mode) and say so up front.
     if (isSessionEphemeral()) setStorageBlocked(true);
+    // eslint-disable-next-line no-console
+    console.info(
+      `[VAXBRIDGE] login bundle ${AUTH_BUILD} | session storage ${isSessionEphemeral() ? "BLOCKED (in-memory only)" : "available"}`
+    );
   }, [checkApi]);
 
   // A token left over from an earlier database can look valid locally while the
@@ -342,6 +356,9 @@ function LoginForm() {
             These passwords exist only for this demo — never reuse them.
           </p>
         </div>
+        <p className="mt-4 text-center text-[10px] tracking-wide text-text-secondary/45" title="Build identifier for support">
+          bundle {AUTH_BUILD}
+        </p>
       </div>
     </div>
   );

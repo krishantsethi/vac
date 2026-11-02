@@ -1,7 +1,11 @@
 """FastAPI dependencies: database session, current user, role authorization."""
 
+import hashlib
+import os
+import sys
 from typing import Annotated
-from fastapi import Depends, HTTPException, status
+
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
 
@@ -10,6 +14,36 @@ from .auth import decode_token
 from .models import User
 
 security = HTTPBearer(auto_error=False)
+
+#: Set AUTH_DIAGNOSTICS=1 to log *why* a request was treated as unauthenticated.
+#:
+#: "Not authenticated" is raised by require_user for four distinct causes, and
+#: the response deliberately does not distinguish them (telling a caller which
+#: part of a credential failed is useful to an attacker). That is right for the
+#: wire and useless for debugging, so the distinction is written to the server
+#: log instead. No secret material is logged: the token is represented only by
+#: its length and a SHA-256 prefix, which cannot be reversed or replayed.
+AUTH_DIAGNOSTICS = os.getenv("AUTH_DIAGNOSTICS", "1") not in ("0", "false", "False")
+
+
+def _diag(reason: str, request: Request | None, token: str | None = None, extra: str = "") -> None:
+    if not AUTH_DIAGNOSTICS:
+        return
+    parts = [f"[auth-diag] {reason}"]
+    if token:
+        digest = hashlib.sha256(token.encode("utf-8", "replace")).hexdigest()[:12]
+        parts.append(f"token_len={len(token)} token_sha256_12={digest}")
+    else:
+        parts.append("token=absent")
+    if request is not None:
+        parts.append(f"path={request.url.path}")
+        ua = request.headers.get("user-agent") or "-"
+        parts.append(f"ua={ua[:110]}")
+        parts.append(f"has_auth_header={'authorization' in request.headers}")
+        parts.append(f"origin={request.headers.get('origin') or '-'}")
+    if extra:
+        parts.append(extra)
+    print(" ".join(parts), file=sys.stderr, flush=True)
 
 
 def get_db():
@@ -24,19 +58,34 @@ DbSession = Annotated[Session, Depends(get_db)]
 
 
 async def get_current_user(
+    request: Request,
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(security)] = None,
     db: Session = Depends(get_db),
 ) -> User | None:
+    raw_header = request.headers.get("authorization")
     token = None
     if credentials is not None:
         token = credentials.credentials
+
     if not token:
+        # Distinguish "no header at all" from "a header HTTPBearer would not
+        # accept" (wrong scheme, empty value). Both look identical to the client.
+        _diag("no_bearer_credentials", request,
+              extra=f"raw_auth_header={'yes' if raw_header else 'no'}")
         return None
+
     user_id = decode_token(token)
     if not user_id:
+        _diag("token_decode_failed", request, token,
+              extra="cause=bad_signature|expired|malformed")
         return None
+
     user = db.get(User, user_id)
-    if user is None or not user.is_active:
+    if user is None:
+        _diag("user_row_not_found", request, token, extra=f"sub={user_id}")
+        return None
+    if not user.is_active:
+        _diag("user_inactive", request, token, extra=f"sub={user_id}")
         return None
     return user
 

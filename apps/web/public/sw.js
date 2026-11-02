@@ -15,7 +15,12 @@
  * (src/lib/offline.ts) — this worker only keeps the interface available.
  */
 
-const VERSION = "vaxbridge-v1";
+// Bumping this string is how stale caches are purged: `activate` deletes every
+// cache whose name does not start with the current VERSION, and the browser
+// re-fetches sw.js byte-for-byte on navigation, so an installed worker from an
+// older build is replaced automatically and its cached shell goes with it.
+// Raise it whenever the shell or precached URLs change.
+const VERSION = "vaxbridge-v2";
 const SHELL_CACHE = `${VERSION}-shell`;
 const ASSET_CACHE = `${VERSION}-assets`;
 

@@ -111,6 +111,23 @@ async def rate_limit_middleware(request: Request, call_next):
 
 
 @app.middleware("http")
+async def no_store_api_middleware(request: Request, call_next):
+    """Keep API responses out of every cache between here and the user.
+
+    These responses carry immunisation records, credentials and audit history.
+    A browser or intermediary that replays a cached GET would show one person's
+    data after another has signed in on the same device, and a cached 401 would
+    look like a live authentication failure. `no-store` forbids that outright;
+    `private` allows a browser to keep it only for the signed-in user.
+    """
+    response = await call_next(request)
+    if request.url.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store, private, max-age=0, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+    return response
+
+
+@app.middleware("http")
 async def audit_middleware(request: Request, call_next):
     request.state.db = SessionLocal()
     try:
