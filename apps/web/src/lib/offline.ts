@@ -17,6 +17,10 @@ const STORAGE_KEY = "vaxbridge_offline_queue";
 const SCHEMA_VERSION = 1;
 
 /** Mirrors MAX_BATCH_SIZE in apps/api/app/offline.py. */
+import * as store from "./persistent-store";
+
+export { hydrate as hydrateOfflineStorage, storageState as offlineStorageState } from "./persistent-store";
+
 export const MAX_BATCH_SIZE = 100;
 
 export interface QueuedEventPayload {
@@ -72,7 +76,7 @@ export function isBrowserOnline(): boolean {
 export function readQueue(): QueuedEvent[] {
   if (typeof window === "undefined") return [];
   try {
-    const raw = window.localStorage.getItem(STORAGE_KEY);
+    const raw = store.getItem(STORAGE_KEY);
     if (!raw) return [];
     const parsed = JSON.parse(raw);
     if (!parsed || parsed.version !== SCHEMA_VERSION || !Array.isArray(parsed.items)) return [];
@@ -87,7 +91,7 @@ export function readQueue(): QueuedEvent[] {
 function writeQueue(items: QueuedEvent[]) {
   if (typeof window === "undefined") return;
   try {
-    window.localStorage.setItem(
+    store.setItem(
       STORAGE_KEY,
       JSON.stringify({ version: SCHEMA_VERSION, items, saved_at: new Date().toISOString() })
     );
@@ -370,7 +374,7 @@ interface ReferenceCache {
 function readReferenceCache(): ReferenceCache | null {
   if (typeof window === "undefined") return null;
   try {
-    const raw = window.localStorage.getItem(REFERENCE_KEY);
+    const raw = store.getItem(REFERENCE_KEY);
     if (!raw) return null;
     const parsed = JSON.parse(raw) as ReferenceCache;
     if (parsed?.version !== 1) return null;
@@ -384,7 +388,7 @@ export function cachePatientOptions(patients: CachedPatientOption[]) {
   if (typeof window === "undefined" || !patients.length) return;
   const existing = readReferenceCache();
   try {
-    window.localStorage.setItem(
+    store.setItem(
       REFERENCE_KEY,
       JSON.stringify({
         version: 1,
@@ -402,7 +406,7 @@ export function cacheVaccineOptions(vaccines: CachedVaccineOption[]) {
   if (typeof window === "undefined" || !vaccines.length) return;
   const existing = readReferenceCache();
   try {
-    window.localStorage.setItem(
+    store.setItem(
       REFERENCE_KEY,
       JSON.stringify({
         version: 1,

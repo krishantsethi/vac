@@ -2,6 +2,7 @@ import type { Metadata, Viewport } from "next";
 import "./globals.css";
 import { Toast } from "@/components/ui/toast";
 import { ServiceWorkerRegister } from "@/components/app/service-worker-register";
+import { StorageHydrate } from "@/components/app/storage-hydrate";
 
 export const viewport: Viewport = {
   themeColor: "#0B1728",
@@ -32,6 +33,7 @@ export default function RootLayout({
   return (
     <html lang="en" suppressHydrationWarning>
       <body className="antialiased">
+        <StorageHydrate />
         <ServiceWorkerRegister />
         {children}
         <Toast />

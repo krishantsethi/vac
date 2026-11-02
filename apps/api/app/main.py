@@ -9,6 +9,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sys
 import time
 import uuid
@@ -19,11 +20,17 @@ from fastapi import FastAPI, Depends, HTTPException, status, Request, UploadFile
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import Response
+from fastapi.responses import RedirectResponse
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import case, func, or_
 
-from .database import engine, Base, SessionLocal, get_db
+from .database import engine, Base, SessionLocal, database_backend, get_db, is_production_database
+from . import ai as ai_providers
+from . import ocr
+from .insights import operational_insights
+from .ocr import ExtractedValue, extract as extract_document_text, ocr_status
+from .storage import StorageError, safe_object_key, storage, storage_status
 from .auth import (
     hash_password,
     verify_password,
@@ -176,10 +183,56 @@ async def audit_middleware(request: Request, call_next):
         request.state.db.close()
 
 
+def _truthy_env(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 @app.on_event("startup")
 def on_startup():
-    Base.metadata.create_all(bind=engine)
-    _ensure_seed_data()
+    """Prepare storage and, where appropriate, the schema.
+
+    The behaviour differs by backend, and deliberately so.
+
+    On SQLite the file is created and seeded on first run, which is what makes
+    the demo work with no setup at all.
+
+    On PostgreSQL neither happens automatically. Migrations own the schema, and
+    the application's database role has no DDL privilege — so `create_all` would
+    not merely be redundant, it would fail. Seeding a managed database is a
+    deliberate act, opt-in through SEED_DEMO_DATA, because writing 365 synthetic
+    clinical rows into a production registry is not something a cold start should
+    decide to do. On a serverless platform startup also runs per instance, so an
+    unconditional seed would repeat work on every scale-out.
+    """
+    if is_production_database():
+        if _truthy_env("RUN_CREATE_ALL"):
+            Base.metadata.create_all(bind=engine)
+        if _truthy_env("SEED_DEMO_DATA"):
+            _ensure_seed_data()
+        else:
+            logger.info(
+                "[startup] postgres backend; schema owned by migrations, "
+                "seeding skipped (set SEED_DEMO_DATA=1 to seed synthetic demo data)"
+            )
+    else:
+        Base.metadata.create_all(bind=engine)
+        _ensure_seed_data()
+
+    # Scratch directory for the local storage backend. A serverless filesystem is
+    # read-only outside /tmp, so probing once at startup turns a later 500 on
+    # upload into a clear log line and a working fallback.
+    try:
+        os.makedirs(UPLOAD_DIR, exist_ok=True)
+        probe = os.path.join(UPLOAD_DIR, ".startup-probe")
+        with open(probe, "w") as fh:
+            fh.write("ok")
+        os.remove(probe)
+    except OSError as exc:
+        logger.error(
+            "[startup] upload_directory_unwritable path=%s error=%s — configure "
+            "STORAGE_BACKEND=supabase or point UPLOAD_DIR at a writable path such as /tmp",
+            UPLOAD_DIR, type(exc).__name__,
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -1136,13 +1189,48 @@ def list_recommendations(patient_id: str, db: DbSession, user: models.User = Dep
 # Documents / OCR (demo mode)
 # --------------------------------------------------------------------------- #
 
-UPLOAD_DIR = os.getenv("UPLOAD_DIR", "./uploads")
+def _default_upload_dir() -> str:
+    """Prefer ./uploads, but fall back to /tmp on a read-only filesystem.
+
+    Serverless runtimes mount the application directory read-only. Without this
+    fallback the import itself raises and every request fails with no useful
+    message; with it, local storage degrades to scratch space and the health
+    endpoint reports that uploads are not durable.
+    """
+    configured = os.getenv("UPLOAD_DIR", "").strip()
+    if configured:
+        return configured
+    candidate = os.path.join(os.getcwd(), "uploads")
+    try:
+        os.makedirs(candidate, exist_ok=True)
+        probe = os.path.join(candidate, ".probe")
+        with open(probe, "w") as fh:
+            fh.write("ok")
+        os.remove(probe)
+        return candidate
+    except OSError:
+        return "/tmp/vaxbridge-uploads"
+
+
+UPLOAD_DIR = _default_upload_dir()
 os.makedirs(UPLOAD_DIR, exist_ok=True)
-DEMO_MODE = os.getenv("OCR_DEMO_MODE", "true").lower() == "true"
+# Retained as the public name the UI and the health endpoint already use. It now
+# means "extraction returns labelled fixtures", which is true for the demo
+# provider and for auto mode when no engine is installed.
+DEMO_MODE = ocr_status()["returns_demo_values"]
 
 
 def _demo_ocr(filename: str):
-    """Deterministic, clearly-labeled demonstration OCR fixture."""
+    """Deterministic, clearly-labeled demonstration OCR fixture.
+
+    Thin wrapper kept for the existing contract and tests; the implementation
+    lives in app/ocr.py alongside the real Tesseract provider.
+    """
+    return {f.field_name: f.field_value for f in ocr.demo_extract(filename).fields}
+
+
+def _legacy_demo_ocr_unused(filename: str):
+    """Superseded by app.ocr.demo_extract. Kept out of the call path."""
     name = filename.lower()
     fixtures = {
         "card_aarav": {
@@ -1199,33 +1287,66 @@ async def upload_document(
     allowed = {"image/jpeg", "image/png", "image/jpg", "application/pdf", "image/webp"}
     if file.content_type not in allowed:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported file type")
-    # Authorize *before* touching the filesystem, so a caller who has no access
-    # to this patient cannot leave orphaned files behind.
+    # Authorize *before* touching storage, so a caller who has no access to this
+    # patient cannot leave orphaned objects behind.
     patient = _require_patient_access(db, user, patient_id)
-    safe_name = f"{int(datetime.now().timestamp())}_{file.filename}"
-    file_path = os.path.join(UPLOAD_DIR, safe_name)
-    with open(file_path, "wb") as f:
-        f.write(content)
 
     doc = models.Document(
         patient_id=patient.id,
         uploaded_by=user.id,
         file_name=file.filename,
-        file_path=file_path,
+        # Placeholder until the row exists; the key embeds the document id so a
+        # retry of the same document overwrites rather than duplicating.
+        file_path="",
         file_type=file.content_type,
         file_size=len(content),
-        status="completed" if DEMO_MODE else "processing",
-        ocr_provider="demo-ocr" if DEMO_MODE else "pending",
-        ocr_status="completed" if DEMO_MODE else "pending",
+        status="processing",
+        ocr_provider="pending",
+        ocr_status="pending",
     )
     db.add(doc)
+    db.flush()   # assigns doc.id without committing
+
+    try:
+        stored = storage().put(
+            safe_object_key(patient.patient_id, doc.id, file.filename),
+            content, file.content_type, file.filename,
+        )
+    except StorageError as exc:
+        db.rollback()
+        # 507 rather than 500: the request was valid, the store refused it.
+        raise HTTPException(status_code=507, detail=str(exc)) from None
+
+    doc.file_path = stored.key
     db.commit()
     db.refresh(doc)
 
-    extracted = []
-    if DEMO_MODE:
+    # Extraction runs through the configured provider. It reports which one ran
+    # and whether the values are fixtures, so a demo result can never be
+    # mistaken for a real read of the uploaded image.
+    result = extract_document_text(content, file.filename, file.content_type)
+    if result.is_demo:
+        # When the provider is the labelled fixture, take the values from
+        # `_demo_ocr`. That function is the documented seam the test suite
+        # patches to drive unmappable-vaccine and ambiguous-date cases, and
+        # routing the demo path through it keeps that contract intact without
+        # weakening the real Tesseract path.
+        from dataclasses import replace as _dc_replace
         fixture = _demo_ocr(file.filename)
-        for field_name, field_value in fixture.items():
+        result = _dc_replace(
+            result,
+            fields=[ExtractedValue(k, v, None) for k, v in fixture.items()],
+        )
+    doc.ocr_provider = result.provider
+    doc.ocr_status = result.status
+    doc.status = "completed" if result.status == "completed" and result.fields else "needs_review"
+    db.commit()
+
+    extracted = []
+    if result.fields:
+        for value in result.fields:
+            field_name, field_value = value.field_name, value.field_value
+            confidence = value.confidence
             requires_review = False
             review_note = None
             if "date" in field_name.lower():
@@ -1239,17 +1360,22 @@ async def upload_document(
                         f"'{field_value}' could not be parsed as a date. Enter the correct "
                         "value from the source document rather than guessing."
                     )
+            # Confidence comes from the provider or is None. The demo fixture
+            # measures nothing, so it reports nothing; Tesseract reports its own
+            # per-word score. A number is never invented to fill the column.
+            if confidence is not None and confidence < 80:
+                requires_review = True
+                review_note = (review_note or "") + (
+                    f" OCR confidence {confidence:.0f}% is below the 80% review threshold."
+                ).strip()
             ef = models.ExtractedField(
                 document_id=doc.id,
                 field_name=field_name,
                 field_value=field_value,
-                # The demonstration OCR fixture supplies no confidence measure,
-                # so none is reported. Inventing a number here would imply a
-                # certainty the provider never gave us.
-                confidence=None,
+                confidence=confidence,
                 is_approved=False,
                 requires_review=requires_review,
-                review_note=review_note,
+                review_note=review_note or None,
             )
             db.add(ef)
             db.flush()
@@ -1257,20 +1383,27 @@ async def upload_document(
                 "id": ef.id,
                 "field_name": ef.field_name,
                 "field_value": ef.field_value,
-                "confidence": None,
+                "confidence": confidence,
                 "is_approved": ef.is_approved,
                 "requires_review": ef.requires_review,
                 "review_note": ef.review_note,
             })
         db.commit()
-        doc.ocr_status = "completed"
-        db.commit()
 
-    _audit(db, user, "upload", "documents", doc.id, {"file_name": file.filename, "demo_mode": DEMO_MODE}, request)
+    _audit(db, user, "upload", "documents", doc.id,
+           {"file_name": file.filename, "ocr_provider": result.provider,
+            "demo_mode": result.is_demo, "storage": stored.backend}, request)
     return {
         "document_id": doc.id,
         "status": doc.status,
-        "demo_mode": DEMO_MODE,
+        # Kept for the existing UI contract, but it now reflects what actually
+        # happened to *this* document rather than a process-wide constant.
+        "demo_mode": result.is_demo,
+        "ocr_provider": result.provider,
+        "ocr_status": result.status,
+        "extraction_detail": result.detail,
+        "storage_backend": stored.backend,
+        "storage_durable": stored.durable,
         "extracted_fields": extracted,
     }
 
@@ -1279,6 +1412,69 @@ async def upload_document(
 def list_documents(patient_id: str, db: DbSession, user: models.User = Depends(require_user)):
     patient = _require_patient_access(db, user, patient_id)
     return db.query(models.Document).filter_by(patient_id=patient.id).order_by(models.Document.created_at.desc()).all()
+
+
+@app.get("/api/v1/documents/{document_id}/content")
+def download_document(
+    document_id: str,
+    db: DbSession,
+    user: models.User = Depends(require_user),
+    request: Request = None,
+):
+    """Return the stored document, or a short-lived signed URL for it.
+
+    Access is checked against the owning patient before any bytes are read, so
+    the endpoint cannot be used to enumerate documents by id. The response is
+    `no-store`: an immunisation card must not end up in a shared browser's disk
+    cache.
+
+    With an object-storage backend the client is redirected to a signed URL that
+    expires in five minutes. With the local backend the bytes are streamed
+    through this process, because a filesystem path is not something a browser
+    can be handed.
+    """
+    doc = db.get(models.Document, document_id)
+    if not doc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+    patient = db.get(models.Patient, doc.patient_id)
+    if not patient:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Patient not found")
+    _check_patient_access(db, user, patient)
+
+    store = storage()
+    signed = store.url(doc.file_path, expires_in=300)
+    if signed:
+        _audit(db, user, "download", "documents", doc.id,
+               {"file_name": doc.file_name, "via": "signed_url"}, request)
+        return RedirectResponse(signed, status_code=302)
+
+    data = store.get(doc.file_path)
+    if data is None:
+        # Distinguish a missing object from a missing record: the row exists, so
+        # the file was lost. On an ephemeral filesystem that is the expected
+        # outcome after a redeploy, and saying so beats a bare 404.
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=(
+                "The document record exists but its file is not in storage. "
+                f"Storage backend '{store.backend}' does not persist files across "
+                "redeployments; configure object storage to retain uploads."
+            ),
+        )
+
+    # A filename is attacker-controlled input reflected into a header.
+    safe_name = re.sub(r'[^A-Za-z0-9._\- ]', "_", doc.file_name or "document")[:180]
+    _audit(db, user, "download", "documents", doc.id,
+           {"file_name": doc.file_name, "via": "stream", "bytes": len(data)}, request)
+    return Response(
+        content=data,
+        media_type=doc.file_type or "application/octet-stream",
+        headers={
+            "Content-Disposition": f'attachment; filename="{safe_name}"',
+            "Cache-Control": "no-store, private, max-age=0, must-revalidate",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 @app.get("/api/v1/documents/{document_id}/fields", response_model=List[schemas.ExtractedFieldOut])
@@ -1824,6 +2020,137 @@ def mark_notification_read(notif_id: str, db: DbSession, user: models.User = Dep
 # across the dashboard, analytics view, and role areas.
 
 SUPPRESSION_THRESHOLD = 5
+
+
+# --------------------------------------------------------------------------- #
+# Insights (deterministic) and optional generative AI
+# --------------------------------------------------------------------------- #
+
+@app.get("/api/v1/insights")
+def get_insights(
+    db: DbSession,
+    user: models.User = Depends(require_capability(rbac.ANALYTICS_VIEW, "view operational insights")),
+):
+    """Operational figures computed directly from registry rows.
+
+    No model and no external service is involved, so this response is complete
+    and identical whether or not an AI provider is configured. Every metric
+    carries its own definition, and coverage is explicitly the completeness of
+    the *registered* population — never population coverage.
+    """
+    return operational_insights(db)
+
+
+@app.get("/api/v1/ai/status")
+def get_ai_status(user: models.User = Depends(require_user)):
+    """Whether the optional generative layer is configured, and if not, why.
+
+    Reports the presence of a key, never its value. Core functionality does not
+    depend on this being true.
+    """
+    return ai_providers.ai_status()
+
+
+@app.post("/api/v1/ai/ask")
+def ai_ask(
+    payload: schemas.AiAskRequest,
+    db: DbSession,
+    request: Request = None,
+    user: models.User = Depends(require_capability(rbac.CLINICAL_READ, "ask questions over clinical records")),
+):
+    """Grounded Q&A over records the caller is already authorised to see.
+
+    Retrieval happens first and is scoped by the same rules as every other
+    clinical endpoint, so this cannot be used to read a record the caller could
+    not otherwise open. The rows placed in the prompt are returned alongside the
+    answer, which makes the response checkable rather than merely plausible.
+
+    With no provider configured the endpoint does not fail and does not invent an
+    answer: it reports that generative AI is unavailable and still returns the
+    retrieved records, which is the part that was always real.
+    """
+    question = (payload.question or "").strip()
+    if not question:
+        raise HTTPException(status_code=422, detail="A question is required.")
+
+    context: List[dict] = []
+    scope_note = ""
+
+    if payload.patient_id:
+        # Same access check every other patient-scoped endpoint applies.
+        patient = _require_patient_access(db, user, payload.patient_id)
+        events = (
+            db.query(models.VaccinationEvent)
+            .filter_by(patient_id=patient.id)
+            .order_by(models.VaccinationEvent.administered_at.desc())
+            .limit(50)
+            .all()
+        )
+        recs = (
+            db.query(models.Recommendation)
+            .filter_by(patient_id=patient.id)
+            .order_by(models.Recommendation.due_date.desc().nullslast())
+            .limit(50)
+            .all()
+        )
+        context = [
+            {
+                "kind": "vaccination_event",
+                "vaccine_code": e.vaccine_code,
+                "vaccine_name": e.vaccine_name,
+                "dose_label": e.dose_label,
+                "administered_at": e.administered_at.isoformat() if e.administered_at else None,
+                "is_verified": bool(e.is_verified),
+                "source": e.source,
+            }
+            for e in events
+        ] + [
+            {
+                "kind": "recommendation",
+                "vaccine_code": r.vaccine_code,
+                "status": r.status,
+                "due_date": r.due_date.isoformat() if r.due_date else None,
+                "explanation": r.explanation,
+            }
+            for r in recs
+        ]
+        scope_note = (
+            f"Retrieved {len(events)} recorded vaccination event(s) and "
+            f"{len(recs)} recommendation(s) for {patient.patient_id}. An absent "
+            "row means the registry does not record that dose; it is not evidence "
+            "the dose was not given."
+        )
+    else:
+        summary = operational_insights(db)
+        context = [
+            {"kind": "coverage", **summary["coverage"]},
+            {"kind": "gaps", **summary["gaps"]},
+            {"kind": "inventory", **summary["inventory"]},
+            {"kind": "review_backlog", **summary["review_backlog"]},
+        ]
+        scope_note = (
+            "No patient was specified, so the context is aggregate operational "
+            "figures only. No individual record was retrieved."
+        )
+
+    result = ai_providers.ask(question, context)
+    _audit(db, user, "ai_ask", "ai", None,
+           {"provider": result.provider, "available": result.available,
+            "context_rows": len(result.grounded_on),
+            "patient_id": payload.patient_id}, request)
+
+    body = result.as_response()
+    body["scope_note"] = scope_note
+    body["question"] = question
+    if not result.available:
+        body["records"] = result.grounded_on
+        body["guidance"] = (
+            "Enhanced AI features are not available in this deployment. The "
+            "retrieved records above are the authoritative source; deterministic "
+            "insights at /api/v1/insights remain fully available and require no "
+            "API key."
+        )
+    return body
 
 
 @app.get("/api/v1/analytics/summary")
@@ -2627,7 +2954,14 @@ def root():
         "name": "VAXBRIDGE AI",
         "status": "running",
         "demo_mode": DEMO_MODE,
-        "database": "sqlite (demo)" if str(engine.url).startswith("sqlite") else str(engine.url),
+        # A backend *label*, never the URL: `str(engine.url)` masks the password
+        # but still discloses the host and username on an unauthenticated
+        # endpoint, which is exactly the detail an attacker wants from a
+        # healthcare deployment.
+        "database": database_backend(),
+        "database_persistent": is_production_database(),
+        "storage_backend": storage_status()["backend"],
+        "ocr_provider": ocr_status()["effective"],
         "docs": "/docs",
         "disclaimer": "Prototype demonstration. Not a government system. Not a substitute for CoWIN, U-WIN, ABDM, or any official immunisation registry.",
     }
@@ -2668,16 +3002,31 @@ def _health_payload(request=None) -> dict:
         user_count = db.query(models.User).count()
         database_ok = True
     except Exception as exc:  # noqa: BLE001 - surfaced, never swallowed
-        database_error = str(exc)
+        # Deliberately NOT str(exc). A driver error message embeds the host,
+        # port, database name and sometimes the user — on an endpoint that
+        # requires no authentication. The exception class and the server log
+        # carry the detail; the response carries only that it failed.
+        logger.error("[health] database_unreachable error=%s", type(exc).__name__)
+        database_error = f"{type(exc).__name__}: the configured database could not be reached."
     finally:
         db.close()
+
+    ocr = ocr_status()
+    store = storage_status()
+    healthy = database_ok and (store["available"] or store["backend"] == "local")
     return {
-        "status": "ok" if database_ok else "degraded",
+        "status": "ok" if healthy else "degraded",
         "database_connected": database_ok,
+        "database_backend": database_backend(),
+        # True only when the store survives a restart or a cold start. A SQLite
+        # file on a serverless host is False, and the UI says so.
+        "database_persistent": is_production_database(),
         "database_error": database_error,
         "seeded_users": user_count,
         "demo_mode": DEMO_MODE,
-        "ocr_provider": "demo-ocr-fixture" if DEMO_MODE else "not configured",
+        "ocr_provider": ocr["effective"],
+        "ocr": ocr,
+        "storage": store,
         "server_time_utc": datetime.utcnow().isoformat() + "Z",
         "external_integrations": "none",
         "request_context": _request_context(request),

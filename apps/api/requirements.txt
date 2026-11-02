@@ -2,6 +2,9 @@ fastapi==0.162.0
 uvicorn==0.54.0
 sqlalchemy==2.1.6
 alembic==1.20.1
+# PostgreSQL driver. Required for any managed database; SQLite needs nothing.
+# The -binary wheel avoids a libpq build step on serverless platforms.
+psycopg2-binary==2.9.10
 bcrypt==5.0.0
 python-jose[cryptography]==3.5.0
 python-multipart==0.0.32

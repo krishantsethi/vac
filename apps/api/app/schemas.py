@@ -279,10 +279,23 @@ class DocumentOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class AiAskRequest(BaseModel):
+    """A grounded question. `patient_id` scopes retrieval to one record."""
+    question: str
+    patient_id: Optional[str] = None
+
+
 class DocumentUploadResponse(BaseModel):
     document_id: str
     status: str
     demo_mode: bool
+    # Which extractor actually ran, and whether the values are labelled fixtures.
+    # Optional so an older client still parses the response.
+    ocr_provider: Optional[str] = None
+    ocr_status: Optional[str] = None
+    extraction_detail: Optional[str] = None
+    storage_backend: Optional[str] = None
+    storage_durable: Optional[bool] = None
     extracted_fields: List[Any] = []
 
 
