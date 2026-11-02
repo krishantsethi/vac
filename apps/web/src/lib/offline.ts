@@ -199,12 +199,14 @@ export async function syncQueue(): Promise<SyncSummary> {
     summary.message = "Still offline. Captures are held safely on this device.";
     return summary;
   }
+  // A locally readable token is a convenience, not a precondition for syncing.
+  //
+  // The session may live only in the httpOnly cookie the API set at sign-in,
+  // which JavaScript cannot read by design. Refusing to sync here would tell a
+  // user who is perfectly signed in to "sign in again" — and would strand their
+  // captured doses on the device. So the request is attempted and the server
+  // decides; `no_session` is reported only on an actual 401.
   const token = getToken();
-  if (!token) {
-    summary.skipped = "no_session";
-    summary.message = "Sign in again to sync. Captures remain on this device until then.";
-    return summary;
-  }
 
   const batch = queue.slice(0, MAX_BATCH_SIZE);
   const rest = queue.slice(MAX_BATCH_SIZE);
@@ -220,12 +222,15 @@ export async function syncQueue(): Promise<SyncSummary> {
 
   let response: any;
   try {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    // Only sent when there is one: an absent or stale local token must not
+    // override the cookie the browser attaches on its own.
+    if (token) headers.Authorization = `Bearer ${token}`;
+
     const res = await fetch("/api/v1/vaccinations/sync", {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${token}`,
-      },
+      credentials: "include",
+      headers,
       body: JSON.stringify({
         events: batch.map((item) => ({
           client_event_id: item.client_event_id,
@@ -241,6 +246,24 @@ export async function syncQueue(): Promise<SyncSummary> {
       }),
     });
 
+    if (res.status === 401 || res.status === 403) {
+      // Genuinely no usable session. Return the batch to `queued` — it was marked
+      // `syncing` above — so nothing is left looking permanently in flight, and
+      // nothing is discarded. The caller is told the truth rather than a
+      // network-flavoured error.
+      writeQueue(
+        readQueue().map((item) =>
+          batch.some((b) => b.client_event_id === item.client_event_id)
+            ? { ...item, status: "queued" as QueuedStatus, last_error: "Session not recognised" }
+            : item
+        )
+      );
+      summary.skipped = "no_session";
+      summary.message =
+        "Your session is not recognised, so nothing was uploaded. Sign in again to sync; " +
+        "captures remain safely on this device until then.";
+      return summary;
+    }
     if (!res.ok) {
       const body = await res.json().catch(() => ({}));
       throw new Error(body.detail || `Sync failed (HTTP ${res.status})`);

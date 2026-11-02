@@ -104,6 +104,21 @@ particles, luminous core, pointer-driven camera drift). It degrades deliberately
 - a React error boundary catches a GPU/context failure and swaps in the static artwork instead of
   taking the page down.
 
+### The sign-in scene
+
+`/login` carries its own, deliberately smaller composition (`LoginScene3D`): a bevelled extruded
+medical cross inside a luminous protective shell, with two orbiting data rings and 70 particles. It
+sits beside a form people need to read, so it is calmer than the hero — lower particle count, a
+capped `dpr` of 1.6, an autorotate slow enough not to pull the eye, and it stops rendering entirely
+when off-screen or under reduced motion. A pure CSS/SVG `LoginSceneFallback` renders behind the same
+error boundary.
+
+The screen is a single viewport with no scrolling: brand, tagline and scene on the left, a compact
+card on the right whose six demonstration accounts live in a `<select>` so none of them require
+scrolling to reach. Below `lg` it collapses to one column. The scene is imported with
+`dynamic(..., { ssr: false })`, which keeps three.js out of the sign-in critical path — `/login`
+ships 9.48 kB (120 kB first load) and its chunk contains no reference to `WebGLRenderer`.
+
 ---
 
 ## Running it
@@ -435,11 +450,25 @@ queue rather than relying on background sync:
   cached list is labelled as cached, with its timestamp.
 - A persistent bar in the app shell always shows connectivity and how many captures are waiting.
   Being offline never looks like being signed out.
+- Syncing does **not** require a locally readable token. A missing one used to abort the upload and
+  tell the worker to "sign in again" even when they were signed in — the session can live only in the
+  httpOnly cookie, which JavaScript cannot read by design. The request is now attempted and the
+  server decides; `no_session` is reported only on a real 401/403, and the batch is returned to
+  `queued` so nothing is stranded or left looking permanently in flight.
 
 A service worker (`public/sw.js`) keeps the shell reachable: navigations are network-first, build
 assets cache-first, and **`/api/` is never cached** — serving stale clinical data offline would be
-worse than showing an error. It registers in production builds only, so it cannot serve stale
-bundles during development.
+worse than showing an error. It registers in production builds only.
+
+In development it does the opposite: any installed worker is **unregistered and its caches deleted**.
+A worker registered during a production run persists in the browser indefinitely — it survives
+reloads, server restarts and rebuilds, and the page that registered it no longer has to exist for it
+to keep controlling the origin. Since this component only ever registered in production, a dev
+session would never have removed one, so a leftover worker keeps serving a cached app shell while the
+source on disk has moved on. That failure is invisible and total: the served bundle verifiably
+contains a fix, and the browser still runs the code from before it. Bumping the `VERSION` constant in
+`sw.js` also purges stale caches from the outside, because the browser re-fetches that file
+byte-for-byte and `activate` deletes every cache whose name does not match.
 
 ---
 
