@@ -1,0 +1,71 @@
+# ---------------------------------------------------------------------------
+# Dependencies and build output
+# ---------------------------------------------------------------------------
+node_modules/
+.next/
+out/
+build/
+dist/
+*.tsbuildinfo
+next-env.d.ts
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ---------------------------------------------------------------------------
+# Databases
+#
+# The demonstration database is generated, not authored: `alembic upgrade head`
+# followed by `_ensure_seed_data()` reproduces it byte-for-byte from a fixed
+# random seed (see README). Committing it would put a dataset in Git and make
+# every reseed a large binary diff.
+# ---------------------------------------------------------------------------
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+apps/api/tests/.test-db/
+
+# ---------------------------------------------------------------------------
+# Runtime uploads
+#
+# Seeded documents reference a path only; no demo file is stored. Anything here
+# at runtime is user-supplied content and must not be committed.
+# ---------------------------------------------------------------------------
+apps/api/uploads/
+
+# ---------------------------------------------------------------------------
+# Secrets and local configuration
+#
+# VAULT_SECRET_KEY / VAULT_RECORD_SECRET must come from the environment. No key
+# material belongs in source control, and none is present in this repository.
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# ---------------------------------------------------------------------------
+# Editor / OS noise
+# ---------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.log
+npm-debug.log*
+yarn-error.log*
